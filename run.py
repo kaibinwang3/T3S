@@ -183,8 +183,66 @@ You can launch the evaluation by setting either --data and --model or --config.
     parser.add_argument(
         '--use-vllm', action='store_true', help='use vllm to generate, the flag is only supported in Llama4 for now')
 
+    parser.add_argument('--nframe', type=int)  # btnkij
+
+    # btnkij: fused attention config
+    # parser.add_argument('--use_fused_attention', action='store_true')
+    # parser.add_argument('--full_attention_layers', type=int, default=2)
+    # parser.add_argument('--alpha', type=float, default=0.9, help='alpha * A_gpu + (1 - alpha) * A_cpu')
+    # parser.add_argument('--cpu_attention_type', type=str, default="random_projection_attention")
+    # parser.add_argument('--proj_dim', type=int, default=16)
+    # parser.add_argument('--n_hashes', type=int, default=8)
+    # parser.add_argument('--top_p', type=float, default=0.1)
+    # parser.add_argument('--n_bits', type=int, default=10)
+
+    # btnkij: sketch config
+    parser.add_argument('--use_sketch', action='store_true')
+    parser.add_argument('--sketch_type', type=str, default=None)
+    parser.add_argument('--num_sketch_tokens', type=int, default=4*13*(13+1))
+
+    # btnkij: merge config
+    parser.add_argument('--use_merge', action='store_true')
+    parser.add_argument('--merge_layer', type=int, default=14)
+    parser.add_argument('--chunk_size', type=int, default=16*13*(13+1))
+
     args = parser.parse_args()
     return args
+
+
+class DictObject(dict):
+    """Dictionary that can be accessed with dot notation and serialized."""
+    
+    def __init__(self, *args, **kwargs):
+        if len(args) == 1 and isinstance(args[0], dict):
+            # Handle initialization with a dictionary
+            super().__init__(**args[0])
+        else:
+            super().__init__(*args, **kwargs)
+        self.__dict__ = self
+        
+        # Convert nested dictionaries recursively
+        for key, value in self.items():
+            if isinstance(value, dict):
+                self[key] = DictObject(value)
+            elif isinstance(value, list):
+                # Handle lists of dictionaries
+                for i, item in enumerate(value):
+                    if isinstance(item, dict):
+                        value[i] = DictObject(item)
+    
+    def to_dict(self):
+        """Convert back to regular dict for serialization."""
+        result = {}
+        for key, value in self.items():
+            if isinstance(value, DictObject):
+                result[key] = value.to_dict()
+            elif isinstance(value, list):
+                # Handle lists of DictObjects
+                result[key] = [item.to_dict() if isinstance(item, DictObject) else item 
+                              for item in value]
+            else:
+                result[key] = value
+        return result
 
 
 def main():
@@ -263,6 +321,7 @@ def main():
                     dataset_kwargs = {}
                     if dataset_name in ['MMLongBench_DOC', 'DUDE', 'DUDE_MINI', 'SLIDEVQA', 'SLIDEVQA_MINI']:
                         dataset_kwargs['model'] = model_name
+                    dataset_kwargs['nframe'] = args.nframe  # btnkij
 
                     # If distributed, first build the dataset on the main process for doing preparation works
                     if WORLD_SIZE > 1:
@@ -327,6 +386,27 @@ def main():
 
                 # Perform the Inference
                 if dataset.MODALITY == 'VIDEO':
+                    # btnkij
+                    # model_config = DictObject(
+                    #     use_fused_attention=args.use_fused_attention,
+                    #     full_attention_layers=args.full_attention_layers,
+                    #     alpha=args.alpha,
+                    #     cpu_attention_type=args.cpu_attention_type,
+                    #     proj_dim=args.proj_dim,
+                    #     n_hashes=args.n_hashes,
+                    #     top_p=args.top_p,
+                    #     n_bits=args.n_bits
+                    # )
+
+                    model_config = DictObject(
+                        use_sketch=args.use_sketch,
+                        sketch_type=args.sketch_type,
+                        num_sketch_tokens=args.num_sketch_tokens,
+                        use_merge=args.use_merge,
+                        merge_layer=args.merge_layer,
+                        chunk_size=args.chunk_size
+                    )
+
                     model = infer_data_job_video(
                         model,
                         work_dir=pred_root,
@@ -335,7 +415,8 @@ def main():
                         result_file_name=result_file_base,
                         verbose=args.verbose,
                         api_nproc=args.api_nproc,
-                        use_vllm=args.use_vllm)
+                        use_vllm=args.use_vllm,
+                        model_config=model_config)
                 elif dataset.TYPE == 'MT':
                     model = infer_data_job_mt(
                         model,

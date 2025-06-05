@@ -499,7 +499,12 @@ class LLaVA_OneVision(BaseModel):
     DEFAULT_IMAGE_TOKEN = "<image>"
     IMAGE_TOKEN_INDEX = -200
 
-    def __init__(self, model_path="lmms-lab/llava-onevision-qwen2-7b-si", **kwargs):
+    def __init__(
+            self,
+            model_path="lmms-lab/llava-onevision-qwen2-7b-si",
+            model_config=None,
+            **kwargs
+    ):
         assert model_path is not None
         try:
             from llava.model.builder import load_pretrained_model
@@ -532,6 +537,8 @@ class LLaVA_OneVision(BaseModel):
 
         rank, world_size = get_rank_and_world_size()
         model_name = get_model_name_from_path(model_path)
+        if model_name == "LLaVA-Video-7B-Qwen2":
+            model_name = "llava_qwen"
         import warnings
         # filter warning align with official code
         warnings.filterwarnings("ignore")
@@ -541,6 +548,7 @@ class LLaVA_OneVision(BaseModel):
             model_name,
             device_map="auto",
             overwrite_config=overwrite_config,
+            model_config=model_config
         )
         model.eval()
         model.tie_weights()
@@ -597,6 +605,7 @@ class LLaVA_OneVision(BaseModel):
         conv.append_message(conv.roles[1], None)
         prompt_question = conv.get_prompt()
 
+        breakpoint()
         input_ids = self.tokenizer_image_token(
             prompt_question, self.tokenizer, self.IMAGE_TOKEN_INDEX, return_tensors="pt"
         )

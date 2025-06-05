@@ -5,6 +5,7 @@ import sys
 import warnings
 import math
 import logging
+from functools import partial
 
 import torch
 
@@ -160,6 +161,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         post_process: bool = False,  # if True, will try to only extract stuff in the last \boxed{}.
         verbose: bool = False,
         use_audio_in_video: bool = False,
+        model_config = None,
         **kwargs,
     ):
         super().__init__(use_custom_prompt=use_custom_prompt)
@@ -201,9 +203,14 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             MODEL_CLS = Qwen2_5OmniForConditionalGeneration
             self.processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
         elif listinstr(['2.5', '2_5', 'qwen25'], model_path.lower()):
-            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-            MODEL_CLS = Qwen2_5_VLForConditionalGeneration
+            from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_path)
+            if model_config.use_fused_attention:
+                from transformers.models.qwen2_5_vl.modeling_my_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+                MODEL_CLS = Qwen2_5_VLForConditionalGeneration
+            else:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                MODEL_CLS = Qwen2_5_VLForConditionalGeneration
         else:
             from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
             MODEL_CLS = Qwen2VLForConditionalGeneration
@@ -242,10 +249,21 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 tensor_parallel_size=tp_size,
                 gpu_memory_utilization=kwargs.get("gpu_utils", 0.9),
             )
-
+        elif model_config.use_fused_attention:
+            self.model = MODEL_CLS.from_pretrained(
+                model_path,
+                torch_dtype='auto',
+                device_map="auto",
+                attn_implementation='flash_attention_2',
+                model_config=model_config,
+            )
+            self.model.eval()
         else:
             self.model = MODEL_CLS.from_pretrained(
-                model_path, torch_dtype='auto', device_map="auto", attn_implementation='flash_attention_2'
+                model_path,
+                torch_dtype='auto',
+                device_map="auto",
+                attn_implementation='flash_attention_2',
             )
             self.model.eval()
 
@@ -420,6 +438,20 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         else:
             images, videos = process_vision_info([messages])
             inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
+
+        # if 'total_video_tokens' not in globals():  # btnkij
+        #     global total_video_tokens, total_text_tokens
+        #     global total_count
+        #     total_count = 0
+        #     total_video_tokens = total_text_tokens = 0
+        # num_video_tokens = text[0].count('<|video_pad|>')
+        # num_text_tokens = inputs['input_ids'].shape[1] - num_video_tokens
+        # total_video_tokens += num_video_tokens
+        # total_text_tokens += num_text_tokens
+        # total_count += 1
+        # print('###', total_video_tokens / total_count, total_text_tokens / total_count, videos[0].shape)
+        # breakpoint()
+
         inputs = inputs.to('cuda')
 
         if listinstr(['omni'], self.model_path.lower()):

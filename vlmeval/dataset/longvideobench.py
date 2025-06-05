@@ -122,7 +122,8 @@ class LongVideoBench(VideoBaseDataset):
         if modelscope_flag_set():
             repo_id = "AI-ModelScope/LongVideoBench"
 
-        cache_path = get_cache_path(repo_id)
+        # cache_path = get_cache_path(repo_id)
+        cache_path = "/mnt/afs/share_data/opencompass/.cache/longvideobench"  # btnkij
 
         if cache_path is None:
             cache_path = osp.expanduser("~/.cache/huggingface/hub/datasets--longvideobench--LongVideoBench")

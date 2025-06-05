@@ -98,7 +98,8 @@ class MLVU_MCQ(VideoBaseDataset):
         if modelscope_flag_set():
             repo_id = "AI-ModelScope/MLVU"
 
-        cache_path = get_cache_path(repo_id)
+        # cache_path = get_cache_path(repo_id)
+        cache_path = "/mnt/afs/share_data/opencompass/.cache/MVLU"  # btnkij
         if cache_path is not None and check_integrity(cache_path):
             dataset_path = cache_path
         else:

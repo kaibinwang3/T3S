@@ -73,7 +73,9 @@ Respond with only the letter (A, B, C, or D) of the correct option.
                     return False
             return True
 
-        cache_path = get_cache_path(repo_id)
+        # cache_path = get_cache_path(repo_id)  # btnkij
+        cache_path = "/mnt/afs/share_data/opencompass/.cache/VideoMME"
+
         if cache_path is not None and check_integrity(cache_path):
             dataset_path = cache_path
         else:

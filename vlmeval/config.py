@@ -58,7 +58,7 @@ ungrouped = {
     ),
     "VisualGLM_6b": partial(VisualGLM, model_path="THUDM/visualglm-6b"),
     "mPLUG-Owl2": partial(mPLUG_Owl2, model_path="MAGAer13/mplug-owl2-llama2-7b"),
-    "mPLUG-Owl3": partial(mPLUG_Owl3, model_path="mPLUG/mPLUG-Owl3-7B-240728"),
+    "mPLUG-Owl3": partial(mPLUG_Owl3, model_path="/mnt/afs/wangkaibin/models/mPLUG-Owl3-7B-241101"),
     "OmniLMM_12B": partial(
         OmniLMM12B, model_path="openbmb/OmniLMM-12B", root=OmniLMM_ROOT
     ),
@@ -621,7 +621,7 @@ llava_series = {
     ),
     "Aquila-VL-2B": partial(LLaVA_OneVision, model_path="BAAI/Aquila-VL-2B-llava-qwen"),
     "llava_video_qwen2_7b": partial(
-        LLaVA_OneVision, model_path="lmms-lab/LLaVA-Video-7B-Qwen2"
+        LLaVA_OneVision, model_path="/mnt/afs/wangkaibin/models/LLaVA-Video-7B-Qwen2"
     ),
     "llava_video_qwen2_72b": partial(
         LLaVA_OneVision, model_path="lmms-lab/LLaVA-Video-72B-Qwen2"
@@ -1090,7 +1090,8 @@ qwen2vl_series = {
     ),
     "Qwen2.5-VL-7B-Instruct": partial(
         Qwen2VLChat,
-        model_path="Qwen/Qwen2.5-VL-7B-Instruct",
+        # model_path="Qwen/Qwen2.5-VL-7B-Instruct",  # btnkij
+        model_path="/mnt/afs/wangkaibin/models/Qwen2.5-VL-7B-Instruct",
         min_pixels=1280 * 28 * 28,
         max_pixels=16384 * 28 * 28,
         use_custom_prompt=False,
