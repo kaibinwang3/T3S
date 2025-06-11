@@ -38,19 +38,13 @@ class DictObject(dict):
 
 
 model_config = DictObject(
-    # use_sketch=True,
-    # sketch_type="frequent_directions",
-    # sketch_type="newest",
-    # num_sketch_tokens=16*13*(13+1),
     use_sketch=False,
-    use_merge=True,
-    merge_layer=27,
-    chunk_size=16*13*(13+1),
-    chunk_id=4
+    use_merge=False,
+    frame_per_chunk=4,
 )
 
 
-model = supported_VLM['llava_video_qwen2_7b'](model_config=model_config)
+model = supported_VLM['icl/llava_video'](model_config=model_config)
 
 message = [
     {

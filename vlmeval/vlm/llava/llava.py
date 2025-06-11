@@ -690,6 +690,7 @@ class LLaVA_OneVision(BaseModel):
         )
 
         # Pass image sizes along with other parameters
+        breakpoint()
         cont = self.model.generate(
             input_ids,
             images=image_tensors,

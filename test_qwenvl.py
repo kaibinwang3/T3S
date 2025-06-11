@@ -1,13 +1,4 @@
-import torch
-import numpy as np
-from transformers import AutoProcessor
-from qwen_vl_utils import process_vision_info
-from transformers.models.qwen2_5_vl.modeling_my_qwen2_5_vl import (
-    Qwen2_5_VLForConditionalGeneration
-)
-# from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-#     Qwen2_5_VLForConditionalGeneration
-# )
+from vlmeval.config import supported_VLM
 
 
 class DictObject(dict):
@@ -47,110 +38,25 @@ class DictObject(dict):
 
 
 model_config = DictObject(
-    use_fused_attention=True,
-    full_attention_layers=2,
-    alpha=0.9,
-    # cpu_attention_type="random_projection_attention",
-    cpu_attention_type="kernelized_attention",
-    # cpu_attention_type="svd_lowrank_attention",
-    # cpu_attention_type="lsh_attention",
-    proj_dim=16,
-    n_hashes=150,
-    head_dim=128,
-    top_p=0.1,
-    n_bits=10
+    # use_sketch=False,
+    # use_merge=False,
+    frame_per_chunk=16
 )
 
-# default: Load the model on the available device(s)
-pretrained_path = "/mnt/afs/wangkaibin/models/Qwen2.5-VL-7B-Instruct"
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    pretrained_path,
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    device_map="auto",
-    model_config=model_config
-)
-processor = AutoProcessor.from_pretrained(pretrained_path)
 
-# Messages containing a local video path and a text query
-messages = [
+model = supported_VLM['icl_qwen2_vl'](model_config=model_config)
+
+message = [
     {
-        "role": "user",
-        "content": [
-            {
-                "type": "video",
-                "video": "file:///mnt/afs/share_data/opencompass/.cache/VideoMME/video/5KlS-p5eYH8.mp4",
-                "fps": 1.0,
-            },
-            {"type": "text", "text": "Describe this video."},
-        ],
+        'type': 'video',
+        'value': '/mnt/afs/share_data/opencompass/.cache/VideoMME/video/0ay2Qy3wBe8.mp4'
+    },
+    {
+        'type': 'text',
+        'value': 'describe this video.'
+        # 'value': '2+3=?'
     }
 ]
 
-# Preparation for inference
-text = processor.apply_chat_template(
-    messages, tokenize=False, add_generation_prompt=True
-)
-image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-video_inputs[0] = video_inputs[0][:300]  # btnkij
-inputs = processor(
-    text=[text],
-    images=image_inputs,
-    videos=video_inputs,
-    padding=True,
-    return_tensors="pt",
-    **video_kwargs,
-)
-inputs = inputs.to("cuda")
-
-# Inference
-generated_ids = model.generate(**inputs, max_new_tokens=1024)
-generated_ids_trimmed = [
-    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-]
-output_text = processor.batch_decode(
-    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-)
-print(output_text)
-
-
-# # Messages containing a local video path and a text query
-# messages = [
-#     {
-#         "role": "user",
-#         "content": [
-#             {
-#                 "type": "video",
-#                 "video": "file:///mnt/afs/share_data/opencompass/.cache/MVBench/video/star/Charades_v1_480/W7CR5.mp4",
-#                 "fps": 1.0,
-#             },
-#             {"type": "text", "text": "Describe this video."},
-#         ],
-#     }
-# ]
-
-# # Preparation for inference
-# text = processor.apply_chat_template(
-#     messages, tokenize=False, add_generation_prompt=True
-# )
-# image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-# inputs = processor(
-#     text=[text],
-#     images=image_inputs,
-#     videos=video_inputs,
-#     padding=True,
-#     return_tensors="pt",
-#     **video_kwargs,
-# )
-# inputs = inputs.to("cuda")
-
-# # Inference
-# generated_ids = model.generate(**inputs, max_new_tokens=128)
-# generated_ids_trimmed = [
-#     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-# ]
-# output_text = processor.batch_decode(
-#     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-# )
-# print(output_text)
-
+response = model.generate(message=message, dataset="Video-MME")
+print(response)

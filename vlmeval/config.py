@@ -1311,3 +1311,10 @@ model_groups = [
 
 for grp in model_groups:
     supported_VLM.update(grp)
+
+
+from vlmeval.vlm.icl_models.llava_video import LLaVAVideo_ICL
+supported_VLM['icl_llava_video'] = LLaVAVideo_ICL
+
+from vlmeval.vlm.qwen2_vl.icl_model import Qwen2VLChat_ICL
+supported_VLM['icl_qwen2_vl'] = Qwen2VLChat_ICL

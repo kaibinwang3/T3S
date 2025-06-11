@@ -87,6 +87,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         res.update(load(out_file))
 
     rank, world_size = get_rank_and_world_size()
+    print('##### infer_data', rank, world_size)
     sheet_indices = list(range(rank, len(dataset), world_size))
     lt = len(sheet_indices)
     data = dataset.data.iloc[sheet_indices]

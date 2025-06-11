@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from omegaconf import OmegaConf
 
 
 # GET the number of GPUs on the node without importing libs like torch
@@ -21,14 +22,19 @@ def get_gpu_list():
 RANK = int(os.environ.get('RANK', 0))
 WORLD_SIZE = int(os.environ.get('WORLD_SIZE', 1))
 GPU_LIST = get_gpu_list()
+# if WORLD_SIZE > 1 and len(GPU_LIST):
+#     NGPU = len(GPU_LIST)
+#     assert NGPU >= WORLD_SIZE, "The number of processes should be less than or equal to the number of GPUs"
+#     GPU_PER_PROC = NGPU // WORLD_SIZE
+#     DEVICE_START_IDX = GPU_PER_PROC * RANK
+#     CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
+#     CUDA_VISIBLE_DEVICES = ','.join(CUDA_VISIBLE_DEVICES)
+#     # Set CUDA_VISIBLE_DEVICES
+#     os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
+#     print(f'RANK: {RANK}, WORLD_SIZE: {WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}')
 if WORLD_SIZE > 1 and len(GPU_LIST):
-    NGPU = len(GPU_LIST)
-    assert NGPU >= WORLD_SIZE, "The number of processes should be less than or equal to the number of GPUs"
-    GPU_PER_PROC = NGPU // WORLD_SIZE
-    DEVICE_START_IDX = GPU_PER_PROC * RANK
-    CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
+    CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST]
     CUDA_VISIBLE_DEVICES = ','.join(CUDA_VISIBLE_DEVICES)
-    # Set CUDA_VISIBLE_DEVICES
     os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
     print(f'RANK: {RANK}, WORLD_SIZE: {WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}')
 
@@ -183,7 +189,9 @@ You can launch the evaluation by setting either --data and --model or --config.
     parser.add_argument(
         '--use-vllm', action='store_true', help='use vllm to generate, the flag is only supported in Llama4 for now')
 
-    parser.add_argument('--nframe', type=int)  # btnkij
+    parser.add_argument('--model_config', type=str, default='')
+
+    # parser.add_argument('--nframe', type=int)  # btnkij
 
     # btnkij: fused attention config
     # parser.add_argument('--use_fused_attention', action='store_true')
@@ -195,15 +203,19 @@ You can launch the evaluation by setting either --data and --model or --config.
     # parser.add_argument('--top_p', type=float, default=0.1)
     # parser.add_argument('--n_bits', type=int, default=10)
 
-    # btnkij: sketch config
-    parser.add_argument('--use_sketch', action='store_true')
-    parser.add_argument('--sketch_type', type=str, default=None)
-    parser.add_argument('--num_sketch_tokens', type=int, default=4*13*(13+1))
+    # # btnkij: sketch config
+    # parser.add_argument('--use_sketch', action='store_true')
+    # parser.add_argument('--sketch_type', type=str, default=None)
+    # parser.add_argument('--num_sketch_tokens', type=int, default=4*13*(13+1))
 
-    # btnkij: merge config
-    parser.add_argument('--use_merge', action='store_true')
-    parser.add_argument('--merge_layer', type=int, default=14)
-    parser.add_argument('--chunk_size', type=int, default=16*13*(13+1))
+    # # btnkij: merge config
+    # parser.add_argument('--use_merge', action='store_true')
+    # parser.add_argument('--merge_layer', type=int, default=14)
+    # parser.add_argument('--chunk_size', type=int, default=16*13*(13+1))
+    # parser.add_argument('--chunk_id', type=int, default=0)
+
+    # # btnkij: icl
+    # parser.add_argument('--frame_per_chunk', type=int, default=16*13*(13+1))
 
     args = parser.parse_args()
     return args
@@ -248,6 +260,7 @@ class DictObject(dict):
 def main():
     logger = get_logger('RUN')
     args = parse_args()
+    model_config = OmegaConf.create(args.model_config)
     use_config, cfg = False, None
     if args.config is not None:
         assert args.data is None and args.model is None, '--data and --model should not be set when using --config'
@@ -321,7 +334,7 @@ def main():
                     dataset_kwargs = {}
                     if dataset_name in ['MMLongBench_DOC', 'DUDE', 'DUDE_MINI', 'SLIDEVQA', 'SLIDEVQA_MINI']:
                         dataset_kwargs['model'] = model_name
-                    dataset_kwargs['nframe'] = args.nframe  # btnkij
+                    dataset_kwargs['nframe'] = model_config.nframe  # btnkij
 
                     # If distributed, first build the dataset on the main process for doing preparation works
                     if WORLD_SIZE > 1:
@@ -398,14 +411,16 @@ def main():
                     #     n_bits=args.n_bits
                     # )
 
-                    model_config = DictObject(
-                        use_sketch=args.use_sketch,
-                        sketch_type=args.sketch_type,
-                        num_sketch_tokens=args.num_sketch_tokens,
-                        use_merge=args.use_merge,
-                        merge_layer=args.merge_layer,
-                        chunk_size=args.chunk_size
-                    )
+                    # model_config = DictObject(
+                    #     use_sketch=args.use_sketch,
+                    #     sketch_type=args.sketch_type,
+                    #     num_sketch_tokens=args.num_sketch_tokens,
+                    #     use_merge=args.use_merge,
+                    #     merge_layer=args.merge_layer,
+                    #     chunk_size=args.chunk_size,
+                    #     chunk_id=args.chunk_id,
+                    #     frame_per_chunk=args.frame_per_chunk
+                    # )
 
                     model = infer_data_job_video(
                         model,
