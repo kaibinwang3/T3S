@@ -94,7 +94,7 @@ def extract_multiple_choice_answer(llm_output: str, options: str = "ABCD") -> st
     return None
 
 
-def excel_column_generator(file_path: str) -> Generator[Tuple[Any, Any], None, None]:
+def excel_column_generator(file_path: str, duration="all") -> Generator[Tuple[Any, Any], None, None]:
     """
     Generator that reads an xlsx file and yields values from columns K and L,
     skipping the first row (header).
@@ -116,9 +116,12 @@ def excel_column_generator(file_path: str) -> Generator[Tuple[Any, Any], None, N
         
         # Skip header (first row) and iterate through remaining rows
         for index in range(1, len(df)):
-            col_k_value = df.iloc[index, 10]  # Column K (11th column, 0-indexed)
-            col_l_value = df.iloc[index, 11]  # Column L (12th column, 0-indexed)
-            yield (col_k_value, col_l_value)
+            if duration != "all":
+                if duration != df.iloc[index, 3]:
+                    continue
+            answer = df.iloc[index, 10]  # Column K (11th column, 0-indexed)
+            prediction = df.iloc[index, 11]  # Column L (12th column, 0-indexed)
+            yield (answer, prediction)
             
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found.")
@@ -129,30 +132,59 @@ def excel_column_generator(file_path: str) -> Generator[Tuple[Any, Any], None, N
 
 
 result_paths = [
-    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250611-qwenvl-videomme-any-chunk0_4-multinode_0/icl_qwen2_vl/icl_qwen2_vl_Video-MME.xlsx",
-    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250611-qwenvl-videomme-any-chunk0_4-multinode_1/icl_qwen2_vl/icl_qwen2_vl_Video-MME.xlsx",
-    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250611-qwenvl-videomme-any-chunk0_4-multinode_2/icl_qwen2_vl/icl_qwen2_vl_Video-MME.xlsx",
-    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250611-qwenvl-videomme-any-chunk0_4-multinode_3/icl_qwen2_vl/icl_qwen2_vl_Video-MME.xlsx",
+    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_1/refine_llava/refine_llava_Video-MME.xlsx",
+    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_2/refine_llava/refine_llava_Video-MME.xlsx",
+    # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_3/refine_llava/refine_llava_Video-MME.xlsx",
+    # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_4/refine_llava/refine_llava_Video-MME.xlsx",
 ]
 # baseline_result_path = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250608-llavavideo-videomme-baseline-probsum-multinode/icl_llava_video/icl_llava_video_Video-MME.xlsx"
 # icl_result_path = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250608-llavavideo-videomme-icl-chunk_all-probsum-multinode/icl_llava_video/icl_llava_video_Video-MME.xlsx"
 
-result_generators = [excel_column_generator(path) for path in result_paths]
+
 # baseline_result_generator = excel_column_generator(baseline_result_path)
 # icl_result_generator = excel_column_generator(icl_result_path)
 
+
+# for num_forward, path in enumerate(result_paths, start=1):
+#     for duration in ["short", "medium", "long", "all"]:
+#         total = correct = 0
+#         for answer, pred in excel_column_generator(path, duration):
+#             total += 1
+#             pred = extract_multiple_choice_answer(pred)
+#             correct += int(answer == pred)
+#         print('###', num_forward, duration, correct / total)
+
+
+for duration in ["short", "medium", "long", "all"]:
+    correct = total = 0
+    result_generators = [excel_column_generator(path, duration) for path in result_paths]
+    while True:
+        try:
+            vote = {key: 0 for key in "ABCD"}
+            for i in range(len(result_generators)):
+                answer, pred = next(result_generators[i])
+                pred = extract_multiple_choice_answer(pred)
+                vote[pred] += 1
+            if vote[answer] > 0:
+                correct += 1
+            total += 1
+        except StopIteration:
+            break
+    print('###', duration, correct / total)
+
+
 # baseline_wrong = num_exclude = num_correct = icl_wrong = 0
-correct = total = 0
-while True:
-    try:
-        vote = {key: 0 for key in "ABCD"}
-        for i in range(len(result_generators)):
-            answer, pred = next(result_generators[i])
-            pred = extract_multiple_choice_answer(pred)
-            vote[pred] += 1
-        if vote[answer] > 0:
-            correct += 1
-        total += 1
+# correct = total = 0
+# while True:
+#     try:
+#         vote = {key: 0 for key in "ABCD"}
+#         for i in range(len(result_generators)):
+#             answer, pred = next(result_generators[i])
+#             pred = extract_multiple_choice_answer(pred)
+#             vote[pred] += 1
+#         if vote[answer] > 0:
+#             correct += 1
+#         total += 1
         # answer, pred = next(baseline_result_generator)
         # baseline_pred = extract_multiple_choice_answer(pred)
         # answer, pred = next(icl_result_generator)
@@ -165,11 +197,11 @@ while True:
         #     num_exclude += 1
         # if baseline_pred != answer and vote[baseline_pred] == 0 and icl_pred == answer:
         #     num_correct += 1
-    except StopIteration:
-        break
+    # except StopIteration:
+    #     break
 
 # print(baseline_wrong)
 # print(icl_wrong)
 # print(num_exclude)
 # print(num_correct)
-print(correct / total)
+# print(correct / total)

@@ -1318,3 +1318,6 @@ supported_VLM['icl_llava_video'] = LLaVAVideo_ICL
 
 from vlmeval.vlm.qwen2_vl.icl_model import Qwen2VLChat_ICL
 supported_VLM['icl_qwen2_vl'] = Qwen2VLChat_ICL
+
+from vlmeval.vlm.llava.refine_llava import RefineLLaVA
+supported_VLM['refine_llava'] = RefineLLaVA
