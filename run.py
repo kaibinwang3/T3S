@@ -399,29 +399,6 @@ def main():
 
                 # Perform the Inference
                 if dataset.MODALITY == 'VIDEO':
-                    # btnkij
-                    # model_config = DictObject(
-                    #     use_fused_attention=args.use_fused_attention,
-                    #     full_attention_layers=args.full_attention_layers,
-                    #     alpha=args.alpha,
-                    #     cpu_attention_type=args.cpu_attention_type,
-                    #     proj_dim=args.proj_dim,
-                    #     n_hashes=args.n_hashes,
-                    #     top_p=args.top_p,
-                    #     n_bits=args.n_bits
-                    # )
-
-                    # model_config = DictObject(
-                    #     use_sketch=args.use_sketch,
-                    #     sketch_type=args.sketch_type,
-                    #     num_sketch_tokens=args.num_sketch_tokens,
-                    #     use_merge=args.use_merge,
-                    #     merge_layer=args.merge_layer,
-                    #     chunk_size=args.chunk_size,
-                    #     chunk_id=args.chunk_id,
-                    #     frame_per_chunk=args.frame_per_chunk
-                    # )
-
                     model = infer_data_job_video(
                         model,
                         work_dir=pred_root,

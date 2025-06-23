@@ -501,7 +501,7 @@ class LLaVA_OneVision(BaseModel):
 
     def __init__(
             self,
-            model_path="lmms-lab/llava-onevision-qwen2-7b-si",
+            model_path="/mnt/afs/wangkaibin/models/LLaVA-Video-7B-Qwen2",
             model_config=None,
             **kwargs
     ):
@@ -546,9 +546,9 @@ class LLaVA_OneVision(BaseModel):
             model_path,
             None,
             model_name,
-            device_map="auto",
+            device_map=0,
             overwrite_config=overwrite_config,
-            model_config=model_config
+            # model_config=model_config
         )
         model.eval()
         model.tie_weights()
@@ -690,7 +690,10 @@ class LLaVA_OneVision(BaseModel):
         )
 
         # Pass image sizes along with other parameters
-        breakpoint()
+        torch.cuda.synchronize(0)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(0)
+        start_time = time.time()
         cont = self.model.generate(
             input_ids,
             images=image_tensors,
@@ -701,8 +704,15 @@ class LLaVA_OneVision(BaseModel):
             modalities=modalities,
             stopping_criteria=[stopping_criteria],
         )
+        torch.cuda.synchronize(0)
+        peak_mem_stats = torch.cuda.max_memory_allocated(0)
+        end_time = time.time()
+        extra = {
+            "time": end_time - start_time,
+            "peak_mem": peak_mem_stats
+        }
         text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)[0]
-        return text_outputs
+        return text_outputs, extra
 
     def load_video(self, video_path, max_frames_num, fps=1, force_sample=False):
         from decord import VideoReader, cpu

@@ -54,12 +54,14 @@ def infer_data(
     work_dir,
     dataset,
     out_file,
+    extra_out_file=None,
     verbose=False,
     api_nproc=4,
     use_vllm=False,
     model_config=dict(),
 ):
     res = load(out_file) if osp.exists(out_file) else {}
+    extra_res = {}
     rank, world_size = get_rank_and_world_size()
     dataset_name = dataset.dataset_name
 
@@ -137,6 +139,11 @@ def infer_data(
                 sample_map[idx], video_llm=getattr(model, 'VIDEO_LLM', False)
             )
         response = model.generate(message=struct, dataset=dataset_name)
+
+        if isinstance(response, tuple):
+            response, extra = response
+            extra_res[idx] = extra
+
         torch.cuda.empty_cache()
 
         if verbose:
@@ -145,9 +152,13 @@ def infer_data(
         res[idx] = response
         if (i + 1) % 20 == 0:
             dump(res, out_file)
+            if len(extra_res) > 0 and extra_out_file is not None:
+                dump(extra_res, extra_out_file)
 
     res = {k: res[k] for k in sample_indices_sub}
     dump(res, out_file)
+    if len(extra_res) > 0 and extra_out_file is not None:
+        dump(extra_res, extra_out_file)
     return model
 
 
@@ -166,12 +177,15 @@ def infer_data_job_video(
     dataset_name = dataset.dataset_name
     rank, world_size = get_rank_and_world_size()
     result_file = osp.join(work_dir, result_file_name)
+    extra_result_file = osp.join(work_dir, "extra.pkl")
     # Dump Predictions to Prev File if result file exists
     if osp.exists(result_file):
         return model
 
     tmpl = osp.join(work_dir, '{}' + f'{world_size}_{osp.splitext(result_file_name)[0]}.pkl')
+    extra_tmpl = osp.join(work_dir, '{}' + f'{world_size}_{osp.splitext(result_file_name)[0]}_extra.pkl')
     out_file = tmpl.format(rank)
+    extra_out_file = extra_tmpl.format(rank)
 
     model = infer_data(
         model=model,
@@ -179,6 +193,7 @@ def infer_data_job_video(
         work_dir=work_dir,
         dataset=dataset,
         out_file=out_file,
+        extra_out_file=extra_out_file,
         verbose=verbose,
         api_nproc=api_nproc,
         use_vllm=use_vllm,
@@ -190,8 +205,12 @@ def infer_data_job_video(
 
     if rank == 0:
         data_all = {}
+        extra_all = {}
         for i in range(world_size):
             data_all.update(load(tmpl.format(i)))
+            extra_out_file = extra_tmpl.format(i)
+            if osp.isfile(extra_out_file):
+                extra_all.update(load(extra_out_file))
 
         meta = dataset.data
         if dataset_name == 'MMBench-Video' and getattr(dataset, 'pack', False):
@@ -205,6 +224,8 @@ def infer_data_job_video(
                 meta.pop('image')
 
         dump(meta, result_file)
+        dump(extra_all, extra_result_file)
         for i in range(world_size):
             os.remove(tmpl.format(i))
+            os.remove(extra_tmpl.format(i))
     return model

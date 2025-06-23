@@ -1,6 +1,8 @@
 import pandas as pd
 import re
 import string
+import pickle
+import numpy as np
 from typing import Generator, Tuple, Any
 
 
@@ -121,7 +123,7 @@ def excel_column_generator(file_path: str, duration="all") -> Generator[Tuple[An
                     continue
             answer = df.iloc[index, 10]  # Column K (11th column, 0-indexed)
             prediction = df.iloc[index, 11]  # Column L (12th column, 0-indexed)
-            yield (answer, prediction)
+            yield (index, answer, prediction)
             
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found.")
@@ -132,17 +134,62 @@ def excel_column_generator(file_path: str, duration="all") -> Generator[Tuple[An
 
 
 result_paths = [
-    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_1/refine_llava/refine_llava_Video-MME.xlsx",
-    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_2/refine_llava/refine_llava_Video-MME.xlsx",
-    # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_3/refine_llava/refine_llava_Video-MME.xlsx",
-    # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-token-num_forward_4/refine_llava/refine_llava_Video-MME.xlsx",
+    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-frame-num_forward_1/refine_llava/refine_llava_Video-MME.xlsx",
+    "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250613-llavavideo-videomme-frame-num_forward_2/refine_llava/refine_llava_Video-MME.xlsx",
 ]
-# baseline_result_path = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250608-llavavideo-videomme-baseline-probsum-multinode/icl_llava_video/icl_llava_video_Video-MME.xlsx"
-# icl_result_path = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250608-llavavideo-videomme-icl-chunk_all-probsum-multinode/icl_llava_video/icl_llava_video_Video-MME.xlsx"
 
 
-# baseline_result_generator = excel_column_generator(baseline_result_path)
-# icl_result_generator = excel_column_generator(icl_result_path)
+for duration in ["short", "medium", "long", "all"]:
+    cnt1 = cnt2 = cnt12 = total = 0
+    path = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250615-llavavideo-videomme-confidence-frame-num_forward_2/refine_llava/T20250616_G/refine_llava_Video-MME.xlsx"
+    extra_path = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250615-llavavideo-videomme-confidence-frame-num_forward_2/refine_llava/T20250616_G/extra.pkl"
+    extra_result = pickle.load(open(extra_path, "rb"))
+    for index, answer, pred in excel_column_generator(path, duration):
+        option_logits = extra_result[index]["option_logits"]
+        top = np.argsort(option_logits)[::-1]
+        pred1 = chr(ord('A') + top[0])
+        pred2 = chr(ord('A') + top[1])
+        if pred1 == answer:
+            cnt1 += 1
+        if pred2 == answer:
+            cnt2 += 1
+        if pred1 == answer or pred2 == answer:
+            cnt12 += 1
+        total += 1
+
+    print(duration, cnt1 / total, cnt2 / total, cnt12 / total)
+
+
+# extra_result_paths = [
+#     "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250614-llavavideo-videomme-confidence-frame-num_forward_1/refine_llava/T20250614_G/extra.pkl",
+#     "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250614-llavavideo-videomme-smallest-confidence-frame-num_forward_2/refine_llava/T20250614_G/extra.pkl",
+# ]
+# extra_results = [
+#     pickle.load(open(extra_result_path, 'rb'))
+#     for extra_result_path in extra_result_paths
+# ]
+
+# num_different_answers_values = []
+# for duration in ["short", "medium", "long", "all"]:
+#     result_generators = [excel_column_generator(path, duration) for path in result_paths]
+#     correct = total = 0
+#     while True:
+#         try:
+#             max_log_prob = float('-inf')
+#             max_answer = None
+#             for i in range(len(result_generators)):
+#                 answer, pred = next(result_generators[i])
+#                 pred = extract_multiple_choice_answer(pred)
+#                 log_prob = extra_results[i][total]["log_prob"]
+#                 if log_prob > max_log_prob:
+#                     max_log_prob = log_prob
+#                     max_answer = pred
+#             if max_answer == answer:
+#                 correct += 1
+#             total += 1
+#         except StopIteration:
+#             break
+#     print(duration, correct / total)
 
 
 # for num_forward, path in enumerate(result_paths, start=1):
@@ -155,23 +202,23 @@ result_paths = [
 #         print('###', num_forward, duration, correct / total)
 
 
-for duration in ["short", "medium", "long", "all"]:
-    correct = total = 0
-    result_generators = [excel_column_generator(path, duration) for path in result_paths]
-    while True:
-        try:
-            vote = {key: 0 for key in "ABCD"}
-            for i in range(len(result_generators)):
-                answer, pred = next(result_generators[i])
-                pred = extract_multiple_choice_answer(pred)
-                vote[pred] += 1
-            if vote[answer] > 0:
-                correct += 1
-            total += 1
-        except StopIteration:
-            break
-    print('###', duration, correct / total)
-
+# num_different_answers_values = []
+# for duration in ["short", "medium", "long", "all"]:
+#     result_generators = [excel_column_generator(path, duration) for path in result_paths]
+#     correct = total = 0
+#     while True:
+#         try:
+#             vote = {key: 0 for key in "ABCD"}
+#             for i in range(len(result_generators)):
+#                 answer, pred = next(result_generators[i])
+#                 pred = extract_multiple_choice_answer(pred)
+#                 vote[pred] += 1
+#             if vote[answer] > 0:
+#                 correct += 1
+#             total += 1
+#         except StopIteration:
+#             break
+#     print(duration, correct / total)
 
 # baseline_wrong = num_exclude = num_correct = icl_wrong = 0
 # correct = total = 0

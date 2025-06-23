@@ -1313,11 +1313,50 @@ for grp in model_groups:
     supported_VLM.update(grp)
 
 
-from vlmeval.vlm.icl_models.llava_video import LLaVAVideo_ICL
-supported_VLM['icl_llava_video'] = LLaVAVideo_ICL
+try:
+    from vlmeval.vlm.llava import LLaVA_OneVision
+    supported_VLM['baseline_llava'] = LLaVA_OneVision
+except:
+    pass
 
-from vlmeval.vlm.qwen2_vl.icl_model import Qwen2VLChat_ICL
-supported_VLM['icl_qwen2_vl'] = Qwen2VLChat_ICL
+try:
+    from vlmeval.vlm.icl_models.llava_video import LLaVAVideo_ICL
+    supported_VLM['icl_llava_video'] = LLaVAVideo_ICL
+except:
+    pass
 
-from vlmeval.vlm.llava.refine_llava import RefineLLaVA
-supported_VLM['refine_llava'] = RefineLLaVA
+try:
+    from vlmeval.vlm.qwen2_vl.icl_model import Qwen2VLChat_ICL
+    supported_VLM['icl_qwen2_vl'] = Qwen2VLChat_ICL
+except:
+    pass
+
+try:
+    from vlmeval.vlm.llava.refine_llava import RefineLLaVA
+    supported_VLM['refine_llava'] = RefineLLaVA
+except:
+    pass
+
+try:
+    from vlmeval.vlm.llava.prodecode_llava import ProdecodeLLaVA
+    supported_VLM['prodecode_llava'] = ProdecodeLLaVA
+except:
+    pass
+
+try:
+    from vlmeval.vlm.llava.vote_llava import VoteLLaVA
+    supported_VLM['vote_llava'] = VoteLLaVA
+except:
+    pass
+
+try:
+    from vlmeval.vlm.qwen2_vl.refine_qwen2vl import RefineQwen2VL
+    supported_VLM['refine_qwen2vl'] = RefineQwen2VL
+except:
+    pass
+
+try:
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl import ProdecodeQwen2VL
+    supported_VLM['prodecode_qwen2vl'] = ProdecodeQwen2VL
+except:
+    pass

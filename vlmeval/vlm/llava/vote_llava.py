@@ -103,7 +103,7 @@ def _sample_next_token(
     return next_token
 
 
-class RefineLLaVA(BaseModel):
+class VoteLLaVA(BaseModel):
     INSTALL_REQ = True
     INTERLEAVE = True
     VIDEO_LLM = True
@@ -381,62 +381,23 @@ class RefineLLaVA(BaseModel):
         prefix_embeds = inputs_embeds[:, :prefix_len, :]
         image_embeds = inputs_embeds[:, prefix_len:prefix_len+image_len, :]
         suffix_embeds = inputs_embeds[:, prefix_len+image_len:, :]
-        prefix_cache_position = torch.arange(0, prefix_len, device=inputs_embeds.device)
-        image_cache_position = torch.arange(prefix_len, prefix_len + image_len, device=inputs_embeds.device)
-        suffix_cache_position = torch.arange(prefix_len + image_len, seq_len, device=inputs_embeds.device)
-        next_cache_position = torch.tensor([seq_len], dtype=torch.long, device=inputs_embeds.device)
-        qkv = None
 
-        for forward_step in range(wrapper.model_config.num_forward):
+        vote_logits = 0
 
-            if qkv is not None:
-                suffix_q = torch.cat([q[:, :, -suffix_len:, :] for q, k, v in qkv], dim=0)
-                image_k = torch.cat([k[:, :, prefix_len:-suffix_len, :] for q, k, v in qkv], dim=0)
-                num_group = suffix_q.shape[1] // image_k.shape[1]  # 7
-                score = flash_attn_kv_score(
-                    suffix_q.transpose(1, 2).contiguous(),
-                    torch.repeat_interleave(image_k, num_group, dim=1).transpose(1, 2).contiguous()
-                )
-                score = score.sum(dim=[0, 1])  # [num_image_tokens]
-                score = torch.rand_like(score)
-                
-                if wrapper.model_config.selection_level == "frame":
-                    score = score.view(-1, token_per_frame).sum(1)
-                    nframe = score.shape[0]
-                    nframe_to_keep = nframe // 2
-                    frame_idx_to_keep = torch.topk(score, nframe_to_keep)[1]
-                    token_idx_to_keep = (
-                        frame_idx_to_keep.unsqueeze(1) * token_per_frame
-                        + torch.arange(token_per_frame, device=score.device)
-                    ).flatten()
-                elif wrapper.model_config.selection_level == "token":
-                    num_token_to_keep = score.shape[0] // 2
-                    token_idx_to_keep = torch.topk(score, num_token_to_keep)[1]
-                else:
-                    raise NotImplementedError()
+        for _ in range(wrapper.model_config.rounds):
+            random_half = torch.randperm(image_len, device=image_embeds.device) < image_len * wrapper.model_config.first_ratio
+            inputs_embeds = torch.cat([prefix_embeds, image_embeds[:, random_half, :], suffix_embeds], dim=1)
+            cache_position = torch.arange(inputs_embeds.shape[1], device=image_embeds.device)
+            last_logits = wrapper._prefill_stage(self, inputs_embeds, cache_position)
+            vote_logits = vote_logits + last_logits / wrapper.model_config.rounds
 
-                image_embeds = image_embeds[:, token_idx_to_keep, :]
-                image_cache_position = image_cache_position[token_idx_to_keep]
+        option_logits = vote_logits[0, option_ids].view(-1, 4).sum(0)
+        max_idx = torch.argmax(option_logits)
+        generated_tokens = option_ids[max_idx].unsqueeze(0)
 
-            inputs_embeds = torch.cat([prefix_embeds, image_embeds, suffix_embeds], dim=1)
-            cache_position = torch.cat([prefix_cache_position, image_cache_position, suffix_cache_position])
-            qkv, last_logits = wrapper._prefill_stage(self, inputs_embeds, cache_position)
-
-        kv = (
-            [k for q, k, v in qkv],
-            [v for q, k, v in qkv]
-        )
-
-        # generated_tokens = wrapper._inference_stage(
-        #     self, kv, last_logits, max_new_tokens, next_cache_position,
-        #     temperature, top_p, top_k, repetition_penalty,
-        #     do_sample, pad_token_id, eos_token_id
-        # )
-        option_logits = last_logits[0, option_ids].view(-1, 4).sum(0)
         extra_info = {
-            "option_logits": option_logits.detach().cpu().numpy()
+            "vote_logits": vote_logits.detach().cpu().numpy()
         }
-        generated_tokens = option_ids[:4][torch.argmax(option_logits)].unsqueeze(0)
         
         return generated_tokens, extra_info
 
@@ -461,12 +422,11 @@ class RefineLLaVA(BaseModel):
             use_cache=True,
             cache_position=cache_position,
             logits_to_keep=1,  # 只保留最后一个位置的logits
-            return_qkv=True
+            return_qkv=False
         )
-        qkv = outputs.qkv
         last_logits = outputs.logits[:, -1, :]
         
-        return qkv, last_logits
+        return last_logits
 
 
     def _inference_stage(
