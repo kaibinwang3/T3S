@@ -1314,49 +1314,120 @@ for grp in model_groups:
 
 
 try:
+    from vlmeval.vlm.llava.prodecode_llava_randframe_token_logits_pack import ProdecodeLlavaVideoRandframeTokenLogitsPack
+    supported_VLM['prodecode_llava_randframe_token_logits_pack'] = ProdecodeLlavaVideoRandframeTokenLogitsPack
+    from vlmeval.vlm.llava.prodecode_llava_randframe_token_logits_pack_timeit import ProdecodeLlavaVideoRandframeTokenLogitsPackTimeit
+    supported_VLM['prodecode_llava_randframe_token_logits_pack_timeit'] = ProdecodeLlavaVideoRandframeTokenLogitsPackTimeit
+
     from vlmeval.vlm.llava import LLaVA_OneVision
     supported_VLM['baseline_llava'] = LLaVA_OneVision
-except:
-    pass
-
-try:
+    from vlmeval.vlm.llava.baseline_llava import BaselineLlavaVideo
+    supported_VLM['baseline_llava_logits'] = BaselineLlavaVideo
     from vlmeval.vlm.icl_models.llava_video import LLaVAVideo_ICL
     supported_VLM['icl_llava_video'] = LLaVAVideo_ICL
-except:
-    pass
-
-try:
-    from vlmeval.vlm.qwen2_vl.icl_model import Qwen2VLChat_ICL
-    supported_VLM['icl_qwen2_vl'] = Qwen2VLChat_ICL
-except:
-    pass
-
-try:
     from vlmeval.vlm.llava.refine_llava import RefineLLaVA
     supported_VLM['refine_llava'] = RefineLLaVA
-except:
-    pass
-
-try:
     from vlmeval.vlm.llava.prodecode_llava import ProdecodeLLaVA
     supported_VLM['prodecode_llava'] = ProdecodeLLaVA
-except:
-    pass
-
-try:
     from vlmeval.vlm.llava.vote_llava import VoteLLaVA
     supported_VLM['vote_llava'] = VoteLLaVA
-except:
+    from vlmeval.vlm.llava.prodecode_llava_frame import ProdecodeLlavaVideoFrame
+    supported_VLM['prodecode_llava_frame'] = ProdecodeLlavaVideoFrame
+    from vlmeval.vlm.llava.prodecode_llava_randframe_token_logits import ProdecodeLlavaVideoRandframeTokenLogits
+    supported_VLM['prodecode_llava_randframe_token_logits'] = ProdecodeLlavaVideoRandframeTokenLogits
+    from vlmeval.vlm.llava.prodecode_llava_fixframe_token_logits import ProdecodeLlavaVideoFixframeTokenLogits
+    supported_VLM['prodecode_llava_fixframe_token_logits'] = ProdecodeLlavaVideoFixframeTokenLogits
+
+    from vlmeval.vlm.llava.baseline_llava_logits_timeit import BaselineLlavaLogitsTimeit
+    supported_VLM['baseline_llava_logits_timeit'] = BaselineLlavaLogitsTimeit
+    from vlmeval.vlm.llava.prodecode_llava_randframe_token_logits_timeit import ProdecodeLlavaVideoRandframeTokenLogitsTimeit
+    supported_VLM['prodecode_llava_randframe_token_logits_timeit'] = ProdecodeLlavaVideoRandframeTokenLogitsTimeit
+
+except Exception as e:
+    print(e)
     pass
 
-try:
-    from vlmeval.vlm.qwen2_vl.refine_qwen2vl import RefineQwen2VL
-    supported_VLM['refine_qwen2vl'] = RefineQwen2VL
-except:
-    pass
 
 try:
-    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl import ProdecodeQwen2VL
-    supported_VLM['prodecode_qwen2vl'] = ProdecodeQwen2VL
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_token_logits_pack import ProdecodeQwen2VLRandframeTokenLogitsPack
+    supported_VLM['prodecode_qwen2vl_randframe_token_logits_pack'] = ProdecodeQwen2VLRandframeTokenLogitsPack
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_token_logits_pack_timeit import ProdecodeQwen2VLRandframeTokenLogitsPackTimeit
+    supported_VLM['prodecode_qwen2vl_randframe_token_logits_pack_timeit'] = ProdecodeQwen2VLRandframeTokenLogitsPackTimeit
+
+    from vlmeval.vlm.qwen2_vl.baseline_qwen2vl_logits import BaselineQwen2VLLogits
+    supported_VLM['baseline_qwen2vl_logits'] = BaselineQwen2VLLogits  # logits
+    # from vlmeval.vlm.qwen2_vl.baseline_qwen2vl_frame import BaselineQwen2VL as BaselineQwen2VLFrame
+    # supported_VLM['baseline_qwen2vl_frame'] = BaselineQwen2VLFrame  # logits
+    # from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_frame_0626 import ProdecodeQwen2VLFrame as ProdecodeQwen2VLFrame0626
+    # supported_VLM['prodecode_qwen2vl_frame_0626'] = ProdecodeQwen2VLFrame0626
+    # from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_frame_0706 import ProdecodeQwen2VLFrame as ProdecodeQwen2VLFrame0706
+    # supported_VLM['prodecode_qwen2vl_frame_0706'] = ProdecodeQwen2VLFrame0706
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_frame_logits import ProdecodeQwen2VLRandframeFrameLogits
+    supported_VLM['prodecode_qwen2vl_randframe_frame_logits'] = ProdecodeQwen2VLRandframeFrameLogits
+    # from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe import ProdecodeQwen2VLRandFrame
+    # supported_VLM['prodecode_qwen2vl_randframe'] = ProdecodeQwen2VLRandFrame
+    # from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_fixframe import ProdecodeQwen2VLFixFrame
+    # supported_VLM['prodecode_qwen2vl_fixframe'] = ProdecodeQwen2VLFixFrame
+    # from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randuni import ProdecodeQwen2VLRanduni
+    # supported_VLM['prodecode_qwen2vl_randuni'] = ProdecodeQwen2VLRanduni
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_token_logits import ProdecodeQwen2VLRandframeTokenLogits
+    supported_VLM['prodecode_qwen2vl_randframe_token_logits'] = ProdecodeQwen2VLRandframeTokenLogits
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_samefixframe_token_logits import ProdecodeQwen2VLSamefixframeTokenLogits
+    supported_VLM['prodecode_qwen2vl_samefixframe_token_logits'] = ProdecodeQwen2VLSamefixframeTokenLogits
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_samerandframe_token_logits import ProdecodeQwen2VLSamerandframeTokenLogits
+    supported_VLM['prodecode_qwen2vl_samerandframe_token_logits'] = ProdecodeQwen2VLSamerandframeTokenLogits
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_fixframe_token_logits import ProdecodeQwen2VLFixframeTokenLogits
+    supported_VLM['prodecode_qwen2vl_fixframe_token_logits'] = ProdecodeQwen2VLFixframeTokenLogits
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_token_gen import ProdecodeQwen2VLRandframeTokenGen
+    supported_VLM['prodecode_qwen2vl_randframe_token_gen'] = ProdecodeQwen2VLRandframeTokenGen
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_attn_logits import ProdecodeQwen2VLRandframeAttnLogits
+    supported_VLM['prodecode_qwen2vl_randframe_attn_logits'] = ProdecodeQwen2VLRandframeAttnLogits
+
+    from vlmeval.vlm.qwen2_vl.fastv_qwen2vl import FastVQwen2VL
+    supported_VLM['fastv_qwen2vl'] = FastVQwen2VL
+    from vlmeval.vlm.qwen2_vl.fastv_qwen2vl_timeit import FastVQwen2VLTimeit
+    supported_VLM['fastv_qwen2vl_timeit'] = FastVQwen2VLTimeit
+
+    from vlmeval.vlm.qwen2_vl.vtw_qwen2vl import VTWQwen2VL
+    supported_VLM['vtw_qwen2vl'] = VTWQwen2VL
+    from vlmeval.vlm.qwen2_vl.vtw_qwen2vl_timeit import VTWQwen2VLTimeit
+    supported_VLM['vtw_qwen2vl_timeit'] = VTWQwen2VLTimeit
+
+    from vlmeval.vlm.qwen2_vl.framefusion_qwenvl_fixfps import FramefusionQwen2VLFixfpsGen
+    supported_VLM['framefusion_qwenvl_fixfps'] = FramefusionQwen2VLFixfpsGen
+
+    from vlmeval.vlm.qwen2_vl.baseline_qwen2vl_logits_timeit import BaselineQwen2vlLogitsTimeit
+    supported_VLM['baseline_qwen2vl_logits_timeit'] = BaselineQwen2vlLogitsTimeit
+    from vlmeval.vlm.qwen2_vl.prodecode_qwen2vl_randframe_token_logits_timeit import ProdecodeQwen2VLRandframeTokenLogitsTimeit
+    supported_VLM['prodecode_qwen2vl_randframe_token_logits_timeit'] = ProdecodeQwen2VLRandframeTokenLogitsTimeit
+
+except Exception as e:
+    print(e)
+    pass
+
+
+try:
+    from vlmeval.vlm.oryx.prodecode_oryx_randframe_token_logits_pack import ProdecodeOryxRandframeLogitsPack
+    supported_VLM['prodecode_oryx_randframe_token_logits_pack'] = ProdecodeOryxRandframeLogitsPack
+    from vlmeval.vlm.oryx.prodecode_oryx_randframe_token_logits_pack_timeit import ProdecodeOryxRandframeLogitsPackTimeit
+    supported_VLM['prodecode_oryx_randframe_token_logits_pack_timeit'] = ProdecodeOryxRandframeLogitsPackTimeit
+
+    from vlmeval.vlm.oryx.oryx import Oryx1_5
+    supported_VLM['baseline_oryx'] = Oryx1_5
+    from vlmeval.vlm.oryx.baseline_oryx_logits import BaselineOryxLogits
+    supported_VLM['baseline_oryx_logits'] = BaselineOryxLogits
+    from vlmeval.vlm.oryx.prodecode_oryx_randframe_token_logits import ProdecodeOryxRandframeLogits
+    supported_VLM['prodecode_oryx_randframe_token_logits'] = ProdecodeOryxRandframeLogits
+    from vlmeval.vlm.oryx.prodecode_oryx_randframe_frame_logits import ProdecodeOryxRandframeFrameLogits
+    supported_VLM['prodecode_oryx_randframe_frame_logits'] = ProdecodeOryxRandframeFrameLogits
+    from vlmeval.vlm.oryx.prodecode_oryx_randframe_token_logits_alpha import ProdecodeOryxRandframeLogitsAlpha
+    supported_VLM['prodecode_oryx_randframe_token_logits_alpha'] = ProdecodeOryxRandframeLogitsAlpha
+    from vlmeval.vlm.oryx.prodecode_oryx_fixframe_token_logits import ProdecodeOryxFixframeLogits
+    supported_VLM['prodecode_oryx_fixframe_token_logits'] = ProdecodeOryxFixframeLogits
+
+    from vlmeval.vlm.oryx.baseline_oryx_logits_timeit import BaselineOryxLogitsTimeit
+    supported_VLM['baseline_oryx_logits_timeit'] = BaselineOryxLogitsTimeit
+    from vlmeval.vlm.oryx.prodecode_oryx_randframe_token_logits_timeit import ProdecodeOryxRandframeTokenLogitsTimeit
+    supported_VLM['prodecode_oryx_randframe_token_logits_timeit'] = ProdecodeOryxRandframeTokenLogitsTimeit
 except:
     pass

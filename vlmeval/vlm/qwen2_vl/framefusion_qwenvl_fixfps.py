@@ -1,0 +1,418 @@
+from __future__ import annotations
+
+import os
+
+import qwen_vl_utils.vision_process
+
+import decord
+import torch
+from torch.nn import CrossEntropyLoss
+import numpy as np
+import os
+import time
+from typing import Tuple, Optional, Union, List, Callable
+from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb, repeat_kv
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.utils import logging
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLCausalLMOutputWithPast
+)
+from types import MethodType
+import sys
+import warnings
+import math
+import logging
+import time
+from functools import partial
+
+from ..base import BaseModel
+from .prompt import Qwen2VLPromptMixin
+from ...smp import get_rank_and_world_size, get_gpu_memory, listinstr
+from ...dataset import DATASET_MODALITY
+
+VLLM_MAX_IMAGE_INPUT_NUM = 24
+
+sys.path.append("/mnt/afs/wangkaibin/VLMEvalKit/thirdparty/FrameFusion")
+from framefusion.interface import apply_framefusion
+
+
+def sample_random_frames_decord(ele: dict) -> Tuple[torch.Tensor, float]:
+    """
+    使用 decord 从视频中随机采样指定数量的帧。
+
+    Args:
+        ele (dict): 一个包含视频配置的字典。
+        支持的键:
+            - "video" (str): 视频的路径。
+            - "nframes" (int): 需要随机采样的帧数。
+
+    Returns:
+        Tuple[torch.Tensor, float]:
+            - torch.Tensor: 形状为 (T, C, H, W) 的视频张量，其中 T 是 nframes。
+            - float: 基于采样密度的名义上的采样率。
+    
+    Raises:
+        FileNotFoundError: 如果视频文件不存在。
+        ValueError: 如果请求的 nframes 无效 (非正数或大于视频总帧数)。
+        KeyError: 如果字典 ele 中缺少 "video" 或 "nframes" 键。
+    """
+    video_path = ele["video"].replace("file://", "")
+    nframes = ele["nframes"]
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"视频文件未找到: {video_path}")
+    if not isinstance(nframes, int) or nframes <= 0:
+        raise ValueError(f"要采样的帧数 'nframes' 必须是一个正整数，但得到的是: {nframes}")
+    try:
+        vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+        total_frames = len(vr)
+        video_fps = vr.get_avg_fps()
+        if nframes > total_frames:
+            print(f"警告：请求采样 {nframes} 帧, 但视频总共只有 {total_frames} 帧。")
+            nframes = total_frames
+        random_indices = np.sort(np.random.choice(total_frames, nframes, replace=False))
+        idx = random_indices.tolist()
+        video = vr.get_batch(idx).asnumpy()
+        video = torch.from_numpy(video).permute(0, 3, 1, 2)
+        sample_fps = nframes / max(total_frames, 1) * video_fps
+        return video, sample_fps
+    except decord.DECORDError as e:
+        raise RuntimeError(f"使用 decord 读取视频失败: {video_path}") from e
+
+
+def ensure_image_url(image: str) -> str:
+    prefixes = ['http://', 'https://', 'file://', 'data:image;']
+    if any(image.startswith(prefix) for prefix in prefixes):
+        return image
+    if os.path.exists(image):
+        return 'file://' + image
+    raise ValueError(f'Invalid image: {image}')
+
+
+def ensure_video_url(video: str) -> str:
+    prefixes = ['http://', 'https://', 'file://', 'data:video;']
+    if any(video.startswith(prefix) for prefix in prefixes):
+        return video
+    if os.path.exists(video):
+        return 'file://' + video
+    raise ValueError(f'Invalid video: {video}')
+
+
+def create_image_content(image_path, min_pixels, max_pixels):
+    base64_image, mime_type = encode_image(image_path)
+    return {
+        "type": "image",
+        "image": f"data:{mime_type};base64,{base64_image}",
+        'min_pixels': min_pixels,
+        'max_pixels': max_pixels
+    }
+
+
+def encode_image(image_path, max_side=None):
+    from mimetypes import guess_type
+    mime_type, _ = guess_type(image_path)
+    if mime_type is None:
+        mime_type = "image/jpeg"
+    image_format = mime_type.split("/")[-1].upper() if mime_type else "JPEG"
+
+    from PIL import Image
+    image = Image.open(image_path)
+    # Handle the alpha channel
+    if image.mode == "RGBA":
+        image = _rgba_to_rgb(image)
+    if max_side:
+        image = _resize_image(image, max_side)
+    encoded_image = _encode_image(image, image_format)
+
+    return encoded_image, mime_type
+
+
+def _encode_image(image, image_format):
+    from io import BytesIO
+    with BytesIO() as output:
+        image.convert("RGB").save(output, format=image_format)
+        import base64
+        base64_encoded_data = base64.b64encode(output.getvalue()).decode("utf-8")
+    return base64_encoded_data
+
+
+def _rgba_to_rgb(image):
+    from PIL import Image
+    background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+    return Image.alpha_composite(background, image).convert("RGB")
+
+
+def _resize_image(image, max_side):
+    resize_scale = max_side / max(image.size)
+    new_size = (
+        int(image.size[0] * resize_scale),
+        int(image.size[1] * resize_scale),
+    )
+    return image.resize(new_size)
+
+
+def process_video(video_path, num_frames, min_pixels, max_pixels):
+    import cv2
+    # Open the video file
+    cap = cv2.VideoCapture(video_path)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)  # Frames per second
+
+    # the sampling rate using max number of frames
+    sampling_gap_maxframe = (
+        1 if not num_frames else math.ceil(frame_count / num_frames)
+    )
+    sampling_gap = max(math.ceil(fps / 5), sampling_gap_maxframe)
+
+    frame_number = 0
+    images = []
+
+    while True:
+        import tempfile
+        success, frame = cap.read()
+        if not success:
+            break
+        # Sample frames based on the dynamic sampling rate
+        if frame_number % sampling_gap == 0:
+            # Create a temporary file for the frame
+            with tempfile.NamedTemporaryFile(
+                suffix=".jpg", delete=False
+            ) as temp_frame:
+                cv2.imwrite(temp_frame.name, frame)
+                images.append(create_image_content(temp_frame.name, min_pixels, max_pixels))
+                os.remove(temp_frame.name)
+        frame_number += 1
+    if frame_number == 0:
+        raise ValueError(f"Failed to read video from {video_path}, check data...")
+    logging.info(
+        f"Sampled {len(images)}/{frame_number} frames from video {video_path}"
+    )
+    cap.release()
+    return images
+
+
+def setup_visible_devices_per_rank():
+    total_gpus = torch.cuda.device_count()
+    rank, world_size = get_rank_and_world_size()
+    assert world_size == 1, "Only support world_size == 1 for vLLM inference"
+    num_gpus = total_gpus // world_size
+    start_idx = rank * num_gpus
+    assigned_devices = list(range(start_idx, start_idx + num_gpus))
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in assigned_devices)
+    logging.info(f"[Rank {rank}] Visible GPUs: {assigned_devices}")
+    return num_gpus
+
+
+class FramefusionQwen2VLFixfpsGen(Qwen2VLPromptMixin, BaseModel):
+    INSTALL_REQ = False
+    INTERLEAVE = True
+    VIDEO_LLM = True
+
+    def __init__(
+        self,
+        model_path: str = "/mnt/afs/wangkaibin/models/Qwen2.5-VL-7B-Instruct",
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
+        total_pixels: int | None = None,
+        max_new_tokens=2048,
+        top_p=0.001,
+        top_k=1,
+        temperature=0.01,
+        repetition_penalty=1.0,
+        use_custom_prompt: bool = True,
+        system_prompt: str | None = None,
+        post_process: bool = False,  # if True, will try to only extract stuff in the last \boxed{}.
+        verbose: bool = False,
+        use_audio_in_video: bool = False,
+        model_config = None,
+        **kwargs,
+    ):
+        # os.environ["FORCE_QWENVL_VIDEO_READER"] = "random_sample"
+        # qwen_vl_utils.vision_process.VIDEO_READER_BACKENDS["random_sample"] = sample_random_frames_decord
+        super().__init__(use_custom_prompt=use_custom_prompt)
+        self.model_config = model_config
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.total_pixels = total_pixels
+        self.max_new_tokens = max_new_tokens
+        if self.total_pixels and self.total_pixels > 24576 * 28 * 28:
+            print('The total number of video tokens might become too large, resulting in an overly long input sequence. We recommend lowering **total_pixels** to below **24576 × 28 × 28**.')  # noqa: E501
+        self.generate_kwargs = dict(
+            max_new_tokens=self.max_new_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+        )
+        self.system_prompt = system_prompt
+        self.verbose = verbose
+        self.post_process = post_process
+        self.fps = kwargs.pop('fps', 2)
+        self.nframe = kwargs.pop('nframe', 128)
+        if self.fps is None and self.nframe is None:
+            print("Warning: fps and nframe are both None, \
+                  using default nframe/fps setting in qwen-vl-utils/qwen-omni-utils, \
+                  the fps/nframe setting in video dataset is omitted")
+        self.use_audio_in_video = use_audio_in_video
+        self.FRAME_FACTOR = 2
+        rank, world_size = get_rank_and_world_size()
+        assert model_path is not None
+        self.model_path = model_path
+        MODEL_CLS = None
+
+        if listinstr(['omni'], model_path.lower()):
+            try:
+                from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+            except Exception as err:
+                logging.critical("pip install git+https://github.com/huggingface/transformers@3a1ead0aabed473eafe527915eea8c197d424356")  # noqa: E501
+                raise err
+            MODEL_CLS = Qwen2_5OmniForConditionalGeneration
+            self.processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
+        elif listinstr(['2.5', '2_5', 'qwen25'], model_path.lower()):
+            from transformers import AutoProcessor
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            self.processor = AutoProcessor.from_pretrained(model_path)
+            MODEL_CLS = Qwen2_5_VLForConditionalGeneration
+        else:
+            from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+            MODEL_CLS = Qwen2VLForConditionalGeneration
+            self.processor = Qwen2VLProcessor.from_pretrained(model_path)
+
+        gpu_mems = get_gpu_memory()
+        max_gpu_mem = max(gpu_mems) if gpu_mems != [] else -1
+        assert max_gpu_mem > 0
+        self.use_vllm = kwargs.get('use_vllm', False)
+        self.limit_mm_per_prompt = VLLM_MAX_IMAGE_INPUT_NUM
+
+        self.model = MODEL_CLS.from_pretrained(
+            model_path,
+            torch_dtype='auto',
+            device_map=0,
+            attn_implementation='flash_attention_2',
+        )
+        self.model.eval()
+        apply_framefusion(
+            self.model,
+            cost=0.5,
+            similarity_lower_bound=0.5,
+            ratio_lower_bound=0.1    
+        )
+
+        torch.cuda.empty_cache()
+
+    def _prepare_content(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
+        """
+        inputs list[dict[str, str]], each dict has keys: ['type', 'value']
+        """
+        content = []
+        for s in inputs:
+            if s['type'] == 'image':
+                item = {'type': 'image', 'image': ensure_image_url(s['value'])}
+                if dataset == 'OCRBench':
+                    item['min_pixels'] = 10 * 10 * 28 * 28
+                    warnings.warn(f"OCRBench dataset uses custom min_pixels={item['min_pixels']}")
+                    if self.max_pixels is not None:
+                        item['max_pixels'] = self.max_pixels
+                else:
+                    if self.min_pixels is not None:
+                        item['min_pixels'] = self.min_pixels
+                    if self.max_pixels is not None:
+                        item['max_pixels'] = self.max_pixels
+                if self.total_pixels is not None:
+                    item['total_pixels'] = self.total_pixels
+            elif s['type'] == 'video':
+                item = {
+                    'type': 'video',
+                    'video': ensure_video_url(s['value'])
+                }
+                if self.min_pixels is not None:
+                    item['min_pixels'] = self.min_pixels
+                if self.max_pixels is not None:
+                    item['max_pixels'] = self.max_pixels
+                if self.total_pixels is not None:
+                    item['total_pixels'] = self.total_pixels
+                if self.fps is not None:
+                    item['fps'] = self.fps
+                elif self.nframe is not None:
+                    import cv2
+                    video = cv2.VideoCapture(s['value'])
+                    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+                    video.release()
+                    if frame_count < self.nframe:
+                        new_frame_count = frame_count // self.FRAME_FACTOR * self.FRAME_FACTOR
+                        print(f"use {new_frame_count} for {s['value']}")
+                        item['nframes'] = new_frame_count
+                    else:
+                        item['nframes'] = self.nframe
+            elif s['type'] == 'text':
+                item = {'type': 'text', 'text': s['value']}
+            elif s['type'] == 'audio':
+                item = {'type':'audio','audio':s['value']}
+            else:
+                raise ValueError(f"Invalid message type: {s['type']}, {s}")
+            content.append(item)
+        return content
+
+    def generate_inner_transformers(self, message, dataset=None):
+        try:
+            from qwen_vl_utils import process_vision_info
+        except Exception as err:
+            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")  # noqa: E501
+            raise err
+
+        messages = []
+        if self.system_prompt is not None:
+            messages.append({'role': 'system', 'content': self.system_prompt})
+        messages.append({'role': 'user', 'content': self._prepare_content(message, dataset=dataset)})
+        if self.verbose:
+            print(f'\033[31m{messages}\033[0m')
+
+        self.generate_kwargs["max_new_tokens"] = 1
+        self.generate_kwargs["do_sample"] = True
+        self.generate_kwargs["top_k"] = None
+        self.generate_kwargs["top_p"] = None
+
+        for conv in messages:
+            for span in conv['content']:
+                if span['type'] == 'video':
+                    span['nframes'] = self.model_config.nframe
+        text = self.processor.apply_chat_template([messages], tokenize=False, add_generation_prompt=True)
+        images, videos = process_vision_info([messages])
+        inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
+        inputs = inputs.to('cuda')
+
+        # if dataset == "LongVideoBench":
+        #     num_options = 5
+        # else:
+        #     num_options = 4
+        # option_ids = self.processor.tokenizer(
+        #     [chr(ord('A') + i) for i in range(num_options)] + [f" {chr(ord('A') + i)}" for i in range(num_options)], 
+        #     return_tensors="pt"
+        # ).input_ids.flatten().to(inputs.input_ids.device)
+
+        torch.cuda.synchronize(0)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(0)
+        start_time = time.time()
+        generated_ids = self.model.generate(**inputs, max_new_tokens=1)
+        torch.cuda.synchronize(0)
+        end_time = time.time()
+        peak_mem_stats = torch.cuda.max_memory_allocated(0)
+        extra = {
+            "time": end_time - start_time,
+            "peak_mem": peak_mem_stats
+        }
+
+        # --- 5. Finalization ---
+        generated_ids = generated_ids[:, inputs["input_ids"].size(1):]
+        response = self.processor.tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+
+        if self.verbose:
+            print(f'\033[32m{response}\033[0m')
+
+        return response, extra
+
+    def generate_inner(self, message, dataset=None):
+        return self.generate_inner_transformers(message, dataset=dataset)

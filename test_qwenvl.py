@@ -10,16 +10,15 @@ model_config = OmegaConf.create({
 
 model = supported_VLM['refine_qwen2vl'](model_config=model_config)
 
-message = [
-    {
-        'type': 'video',
-        'value': '/mnt/afs/share_data/opencompass/.cache/VideoMME/video/0ay2Qy3wBe8.mp4'
-    },
-    {
-        'type': 'text',
-        'value': 'describe this video.'
-    }
+messages1 = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "hello"},
 ]
+messages2 = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Who are you?"},
+]
+messages = [messages1, messages2]
 
-response = model.generate(message=message, dataset="Video-MME")
+response = model.generate(message=messages, dataset="Video-MME")
 print(response)

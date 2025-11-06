@@ -1,6 +1,60 @@
 from __future__ import annotations
 
 import os
+
+import qwen_vl_utils.vision_process
+
+import decord
+import torch
+import numpy as np
+import os
+import time
+from typing import Tuple
+
+def sample_random_frames_decord(ele: dict) -> Tuple[torch.Tensor, float]:
+    """
+    使用 decord 从视频中随机采样指定数量的帧。
+
+    Args:
+        ele (dict): 一个包含视频配置的字典。
+        支持的键:
+            - "video" (str): 视频的路径。
+            - "nframes" (int): 需要随机采样的帧数。
+
+    Returns:
+        Tuple[torch.Tensor, float]:
+            - torch.Tensor: 形状为 (T, C, H, W) 的视频张量，其中 T 是 nframes。
+            - float: 基于采样密度的名义上的采样率。
+    
+    Raises:
+        FileNotFoundError: 如果视频文件不存在。
+        ValueError: 如果请求的 nframes 无效 (非正数或大于视频总帧数)。
+        KeyError: 如果字典 ele 中缺少 "video" 或 "nframes" 键。
+    """
+    video_path = ele["video"].replace("file://", "")
+    nframes = ele["nframes"]
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"视频文件未找到: {video_path}")
+    if not isinstance(nframes, int) or nframes <= 0:
+        raise ValueError(f"要采样的帧数 'nframes' 必须是一个正整数，但得到的是: {nframes}")
+    try:
+        vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+        total_frames = len(vr)
+        video_fps = vr.get_avg_fps()
+        if nframes > total_frames:
+            raise ValueError(
+                f"请求采样 {nframes} 帧, 但视频总共只有 {total_frames} 帧。"
+            )
+        random_indices = np.sort(np.random.choice(total_frames, nframes, replace=False))
+        idx = random_indices.tolist()
+        video = vr.get_batch(idx).asnumpy()
+        video = torch.from_numpy(video).permute(0, 3, 1, 2)
+        sample_fps = nframes / max(total_frames, 1) * video_fps
+        return video, sample_fps
+    except decord.DECORDError as e:
+        raise RuntimeError(f"使用 decord 读取视频失败: {video_path}") from e
+
+
 import sys
 import warnings
 import math
@@ -141,7 +195,7 @@ def setup_visible_devices_per_rank():
     return num_gpus
 
 
-class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+class BaselineQwen2VLLogits(Qwen2VLPromptMixin, BaseModel):
     INSTALL_REQ = False
     INTERLEAVE = True
     VIDEO_LLM = True
@@ -165,7 +219,10 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         model_config = None,
         **kwargs,
     ):
+        # os.environ["FORCE_QWENVL_VIDEO_READER"] = "random_sample"
+        # qwen_vl_utils.vision_process.VIDEO_READER_BACKENDS["random_sample"] = sample_random_frames_decord
         super().__init__(use_custom_prompt=use_custom_prompt)
+
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
@@ -205,14 +262,8 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             self.processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
         elif listinstr(['2.5', '2_5', 'qwen25'], model_path.lower()):
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_path)
-            # if model_config.use_fused_attention:
-            #     from transformers.models.qwen2_5_vl.modeling_my_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
-            #     MODEL_CLS = Qwen2_5_VLForConditionalGeneration
-            # else:
-            #     from transformers import Qwen2_5_VLForConditionalGeneration
-            #     MODEL_CLS = Qwen2_5_VLForConditionalGeneration
             from transformers import Qwen2_5_VLForConditionalGeneration
+            self.processor = AutoProcessor.from_pretrained(model_path)
             MODEL_CLS = Qwen2_5_VLForConditionalGeneration
         else:
             from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
@@ -224,51 +275,14 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         assert max_gpu_mem > 0
         self.use_vllm = kwargs.get('use_vllm', False)
         self.limit_mm_per_prompt = VLLM_MAX_IMAGE_INPUT_NUM
-        if self.use_vllm:
-            from vllm import LLM
-            gpu_count = setup_visible_devices_per_rank()
-            if gpu_count >= 8:
-                tp_size = 8
-            elif gpu_count >= 4:
-                tp_size = 4
-            elif gpu_count >= 2:
-                tp_size = 2
-            else:
-                tp_size = 1
-            logging.info(
-                f'Using vLLM for {self.model_path} inference with {tp_size} GPUs (available: {gpu_count})'
-            )
-            import os
-            if os.environ.get('VLLM_WORKER_MULTIPROC_METHOD') != 'spawn':
-                logging.warning(
-                    'VLLM_WORKER_MULTIPROC_METHOD is not set to spawn.'
-                    'Use \'export VLLM_WORKER_MULTIPROC_METHOD=spawn\' to avoid potential multi-process issues'
-                )
-            self.llm = LLM(
-                model=self.model_path,
-                max_num_seqs=5,
-                max_model_len=32768,
-                limit_mm_per_prompt={"image": self.limit_mm_per_prompt},
-                tensor_parallel_size=tp_size,
-                gpu_memory_utilization=kwargs.get("gpu_utils", 0.9),
-            )
-        # elif model_config.use_fused_attention:
-        #     self.model = MODEL_CLS.from_pretrained(
-        #         model_path,
-        #         torch_dtype='auto',
-        #         device_map="auto",
-        #         attn_implementation='flash_attention_2',
-        #         model_config=model_config,
-        #     )
-        #     self.model.eval()
-        else:
-            self.model = MODEL_CLS.from_pretrained(
-                model_path,
-                torch_dtype='auto',
-                device_map=0,
-                attn_implementation='flash_attention_2',
-            )
-            self.model.eval()
+
+        self.model = MODEL_CLS.from_pretrained(
+            model_path,
+            torch_dtype='auto',
+            device_map=0,
+            attn_implementation='flash_attention_2',
+        )
+        self.model.eval()
 
         torch.cuda.empty_cache()
 
@@ -325,107 +339,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             content.append(item)
         return content
 
-    def _prepare_content_vllm(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
-        """
-        inputs list[dict[str, str]], each dict has keys: ['type', 'value']
-        """
-        content = []
-        video_inputs = [s for s in inputs if s['type'] == 'video']
-        video_count = len(video_inputs)
-        cur_image_count = 0
-        for s in inputs:
-            if s['type'] == 'image':
-                item = {'type': 'image', 'image': ensure_image_url(s['value'])}
-                if dataset == 'OCRBench':
-                    item['min_pixels'] = 10 * 10 * 28 * 28
-                    warnings.warn(f"OCRBench dataset uses custom min_pixels={item['min_pixels']}")
-                    if self.max_pixels is not None:
-                        item['max_pixels'] = self.max_pixels
-                else:
-                    if self.min_pixels is not None:
-                        item['min_pixels'] = self.min_pixels
-                    if self.max_pixels is not None:
-                        item['max_pixels'] = self.max_pixels
-                if self.total_pixels is not None:
-                    item['total_pixels'] = self.total_pixels
-                if cur_image_count < self.limit_mm_per_prompt:
-                    content.append(item)
-                    cur_image_count += 1
-                else:
-                    logging.warning(
-                        f"Number of images exceeds the limit of {self.limit_mm_per_prompt}. "
-                        f"Only the first {self.limit_mm_per_prompt} images will be used."
-                    )
-            elif s['type'] == 'video':
-                if video_count > 1:
-                    logging.warning(
-                        "Multiple videos detected. Using video frames for each video"
-                    )
-                    if dataset == 'OCRBench':
-                        min_pixels = 10 * 10 * 28 * 28
-                        warnings.warn(f"OCRBench dataset uses custom min_pixels={min_pixels}")
-                        if self.max_pixels is not None:
-                            max_pixels = self.max_pixels
-                    else:
-                        if self.min_pixels is not None:
-                            min_pixels = self.min_pixels
-                        if self.max_pixels is not None:
-                            max_pixels = self.max_pixels
-                    import cv2
-                    video = cv2.VideoCapture(s['value'])
-                    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video.release()
-
-                    frames_per_video = max(1, self.limit_mm_per_prompt // video_count)
-                    content.append({"type": "text", "text": "<video frames start>"})
-                    content.extend(process_video(s['value'], frames_per_video, min_pixels, max_pixels))
-                    content.append({"type": "text", "text": "<video frames end>"})
-
-                else:
-                    item = {
-                        'type': 'video',
-                        'video': ensure_video_url(s['value'])
-                    }
-                    if self.min_pixels is not None:
-                        item['min_pixels'] = self.min_pixels
-                    if self.max_pixels is not None:
-                        item['max_pixels'] = self.max_pixels
-                    if self.total_pixels is not None:
-                        item['total_pixels'] = self.total_pixels
-                    if self.fps is not None:
-                        item['fps'] = self.fps
-                    elif self.nframe is not None:
-                        import cv2
-                        video = cv2.VideoCapture(s['value'])
-                        frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-                        video.release()
-                        if frame_count < self.nframe:
-                            new_frame_count = frame_count // self.FRAME_FACTOR * self.FRAME_FACTOR
-                            print(f"use {new_frame_count} for {s['value']}")
-                            item['nframes'] = new_frame_count
-                        else:
-                            item['nframes'] = self.nframe
-                    content.append(item)
-            elif s['type'] == 'text':
-                item = {'type': 'text', 'text': s['value']}
-                content.append(item)
-            else:
-                raise ValueError(f"Invalid message type: {s['type']}, {s}")
-        return content
-
     def generate_inner_transformers(self, message, dataset=None):
-        if listinstr(['omni'], self.model_path.lower()):
-            try:
-                from qwen_omni_utils import process_mm_info
-            except Exception as err:
-                logging.critical("qwen_omni_utils not found, please install it via 'pip install qwen-omni-utils[decord]'")  # noqa: E501
-                raise err
-        else:
-            try:
-                from qwen_vl_utils import process_vision_info
-            except Exception as err:
-                logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")  # noqa: E501
-                raise err
+        try:
+            from qwen_vl_utils import process_vision_info
+        except Exception as err:
+            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")  # noqa: E501
+            raise err
 
         messages = []
         if self.system_prompt is not None:
@@ -434,27 +353,40 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         if self.verbose:
             print(f'\033[31m{messages}\033[0m')
 
-        text = self.processor.apply_chat_template([messages], tokenize=False, add_generation_prompt=True)
-        if listinstr(['omni'], self.model_path.lower()):
-            audios, images, videos = process_mm_info([messages], use_audio_in_video=self.use_audio_in_video)
-            inputs = self.processor(text=text, images=images,audio=audios, videos=videos, padding=True, return_tensors='pt',use_audio_in_video=self.use_audio_in_video)  # noqa: E501
-        else:
-            images, videos = process_vision_info([messages])
-            inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
+        self.generate_kwargs["max_new_tokens"] = 1
+        self.generate_kwargs["do_sample"] = True
+        self.generate_kwargs["top_k"] = None
+        self.generate_kwargs["top_p"] = None
 
+        text = self.processor.apply_chat_template([messages], tokenize=False, add_generation_prompt=True)
+
+        images, videos = process_vision_info([messages])
+        inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
         inputs = inputs.to('cuda')
 
-        if listinstr(['omni'], self.model_path.lower()):
-            self.generate_kwargs['use_audio_in_video'] = self.use_audio_in_video
-            self.generate_kwargs['return_audio'] = False
+        if dataset == "LongVideoBench":
+            num_options = 5
+        else:
+            num_options = 4
+        option_ids = self.processor.tokenizer(
+            [chr(ord('A') + i) for i in range(num_options)] + [f" {chr(ord('A') + i)}" for i in range(num_options)], 
+            return_tensors="pt"
+        ).input_ids.flatten().to(inputs.input_ids.device)
+
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                print(key, value.shape)
+        breakpoint()
 
         torch.cuda.synchronize(0)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(0)
         start_time = time.time()
-        generated_ids = self.model.generate(
+        outputs = self.model.generate(
             **inputs,
             **self.generate_kwargs,
+            output_scores=True,
+            return_dict_in_generate=True
         )
         end_time = time.time()
         torch.cuda.synchronize(0)
@@ -464,9 +396,10 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             "peak_mem": peak_mem_stats
         }
 
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-        ]
+        scores = outputs.scores[0]
+        option_scores = scores[:, option_ids].view(-1, num_options).sum(0)
+        generated_ids = option_ids[torch.argmax(option_scores)].unsqueeze(0)
+
         out = self.processor.tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
@@ -493,103 +426,5 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             print(f'\033[32m{response}\033[0m')
         return response, extra
 
-    def generate_inner_vllm(self, message, dataset=None):
-        from vllm import SamplingParams
-
-        if listinstr(['omni'], self.model_path.lower()):
-            try:
-                from qwen_omni_utils import process_mm_info
-            except Exception as err:
-                logging.critical("qwen_omni_utils not found, please install it via 'pip install qwen-omni-utils[decord]'")  # noqa: E501
-                raise err
-        else:
-            try:
-                from qwen_vl_utils import process_vision_info
-            except Exception as err:
-                logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")  # noqa: E501
-                raise err
-
-        messages = []
-        if self.system_prompt is not None:
-            messages.append({'role': 'system', 'content': self.system_prompt})
-        messages.append({'role': 'user', 'content': self._prepare_content_vllm(message, dataset=dataset)})
-        if self.verbose:
-            print(f'\033[31m{messages}\033[0m')
-
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        if listinstr(['omni'], self.model_path.lower()):
-            audios, images, videos = process_mm_info(messages, use_audio_in_video=self.use_audio_in_video)
-        else:
-            images, videos = process_vision_info(messages)
-        print('finishing process vision info in vllm.')
-
-        if DATASET_MODALITY(dataset) == 'VIDEO':
-            assert len(videos) == 1
-            videos_nd = [videos[0].detach().cpu().numpy().transpose(0, 2, 3, 1)]
-
-            video_inputs = {
-                "prompt": text[0],
-                "multi_modal_data": {"video": videos_nd[0]},
-                "mm_processor_kwargs":{}
-            }
-            if self.use_audio_in_video:
-                import vllm
-                assert not vllm.envs.VLLM_USE_V1, ("V1 does not support use_audio_in_video. Please launch this example with `VLLM_USE_V1=0`.")  # noqa: E501
-                video_inputs["multi_modal_data"]["audio"] = audios[0]
-                video_inputs['mm_processor_kwargs']['use_audio_in_video'] = True
-            if videos_nd[0].shape[0] > VLLM_MAX_IMAGE_INPUT_NUM:
-                print('video input sequence may be too long for vllm, Maybe cannot generate response for VLLM')
-        sampling_params = SamplingParams(
-            temperature=0.0, max_tokens=self.max_new_tokens, stop_token_ids=None
-        )
-        if images:
-            outputs = self.llm.generate(
-                {
-                    "prompt": text,
-                    "multi_modal_data": {"image": images},
-                },
-                sampling_params=sampling_params,
-            )
-        elif videos_nd:
-            outputs = self.llm.generate(
-                video_inputs,
-                sampling_params=sampling_params,
-            )
-        else:
-            outputs = self.llm.generate(
-                {
-                    "prompt": text,
-                },
-                sampling_params=sampling_params,
-            )
-
-        for o in outputs:
-            generated_text = o.outputs[0].text
-
-        if self.post_process:
-            resp = generated_text.split('\\boxed{')[-1]
-            lt = len(resp)
-            counter, end = 1, None
-            for i in range(lt):
-                if resp[i] == '{':
-                    counter += 1
-                elif resp[i] == '}':
-                    counter -= 1
-                if counter == 0:
-                    end = i
-                    break
-                elif i == lt - 1:
-                    end = lt
-                    break
-            if end is not None:
-                generated_text = resp[:end]
-
-        if self.verbose:
-            print(f'\033[32m{generated_text}\033[0m')
-        return generated_text
-
     def generate_inner(self, message, dataset=None):
-        if self.use_vllm:
-            return self.generate_inner_vllm(message, dataset=dataset)
-        else:
-            return self.generate_inner_transformers(message, dataset=dataset)
+        return self.generate_inner_transformers(message, dataset=dataset)

@@ -48,6 +48,29 @@ def infer_data_api(model, work_dir, model_name, dataset, samples_dict={}, api_np
     return res
 
 
+def sample_evenly(data, num_samples):
+    """
+    从列表中均匀等距地抽取指定数量的元素。
+    
+    :param data: 原始列表
+    :param num_samples: 希望抽取的元素数量
+    :return: 抽样后的新列表
+    """
+    n = len(data)
+    # 如果列表长度小于等于需要抽样的数量，直接返回原列表
+    if n <= num_samples:
+        return data.copy() # 返回副本以避免修改原列表
+
+    # 计算采样步长。我们要在 n-1 的总长度中，取出 num_samples-1 个间隔
+    step = (n - 1) / (num_samples - 1)
+    
+    # 使用列表推导式生成结果
+    # round()函数用于处理步长为小数时的情况，确保索引是整数
+    indices = [round(i * step) for i in range(num_samples)]
+    
+    return [data[i] for i in indices]
+
+
 def infer_data(
     model,
     model_name,
@@ -66,6 +89,8 @@ def infer_data(
     dataset_name = dataset.dataset_name
 
     sample_indices = list(dataset.videos) if getattr(dataset, 'pack', False) else list(dataset.data['index'])
+    if model_name.endswith('_timeit'):
+        sample_indices = sample_evenly(sample_indices, model_config.timeit.warmup_step + model_config.timeit.test_step)
     samples = list(dataset.videos) if getattr(dataset, 'pack', False) else list(range(len(dataset.data)))
     sample_map = {i: s for i, s in zip(sample_indices, samples)}
 
@@ -177,7 +202,7 @@ def infer_data_job_video(
     dataset_name = dataset.dataset_name
     rank, world_size = get_rank_and_world_size()
     result_file = osp.join(work_dir, result_file_name)
-    extra_result_file = osp.join(work_dir, "extra.pkl")
+    extra_result_file = osp.join(work_dir, result_file_name.split('.')[0] + '_extra.pkl')
     # Dump Predictions to Prev File if result file exists
     if osp.exists(result_file):
         return model
@@ -226,6 +251,8 @@ def infer_data_job_video(
         dump(meta, result_file)
         dump(extra_all, extra_result_file)
         for i in range(world_size):
-            os.remove(tmpl.format(i))
-            os.remove(extra_tmpl.format(i))
+            if os.path.isfile(tmpl.format(i)):
+                os.remove(tmpl.format(i))
+            if os.path.isfile(extra_tmpl.format(i)):
+                os.remove(extra_tmpl.format(i))
     return model

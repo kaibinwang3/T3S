@@ -141,16 +141,16 @@ class MLVU_MCQ(VideoBaseDataset):
         return dict(root=dataset_path, data_file=data_file)
 
     def qa_template(self, data):
-        question = f"Question: {data['question']}\n"
-        question += 'Options:\n'
+        question = data['question']
+        question += '\nOptions:\n'
         answer = data['answer']
         answer_idx = -1
         for idx, c in enumerate(eval(data['candidates'])):
-            question += f"({chr(ord('A') + idx)}) {c}\n"
+            question += f"{chr(ord('A') + idx)}. {c}\n"
             if c == answer:
                 answer_idx = idx
         question = question.rstrip()
-        answer = f"({chr(ord('A') + answer_idx)}) {answer}"
+        answer = chr(ord('A') + answer_idx)
         return question, answer
 
     def save_video_frames(self, line):
@@ -195,8 +195,7 @@ class MLVU_MCQ(VideoBaseDataset):
             line = self.data.iloc[line]
 
         question, answer = self.qa_template(line)
-        message = [dict(type='text', value=self.SYS, role='system')]
-        message.append(dict(type='text', value=question))
+        message = []
         video_path = os.path.join(self.data_root, line['prefix'], line['video'])
         if video_llm:
             message.append(dict(type='video', value=video_path))
@@ -204,7 +203,9 @@ class MLVU_MCQ(VideoBaseDataset):
             img_frame_paths = self.save_video_into_images(line)
             for im in img_frame_paths:
                 message.append(dict(type='image', value=im))
-        message.append(dict(type='text', value='\nOnly give the best option.'))
+        # message = [dict(type='text', value=self.SYS, role='system')]
+        message.append(dict(type='text', value=question))
+        message.append(dict(type='text', value='\nAnswer with the option\'s letter from the given choices directly.'))
         return message
 
     @classmethod

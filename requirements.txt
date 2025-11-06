@@ -25,7 +25,7 @@ sty
 tabulate
 tiktoken
 timeout-decorator
-torch
+torch==2.4.1
 torchvision
 tqdm
 transformers

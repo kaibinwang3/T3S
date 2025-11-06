@@ -1,27 +1,62 @@
 from __future__ import annotations
 
 import os
+
+import qwen_vl_utils.vision_process
+
+import decord
+import torch
+import numpy as np
+import os
+import time
+from copy import deepcopy
+from typing import Tuple, Optional, Union, List
+from qwen_vl_utils.vision_process import VIDEO_TOTAL_PIXELS
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLCausalLMOutputWithPast
+)
+
+
+def sample_fix_random_frames_decord(ele: dict) -> Tuple[torch.Tensor, float]:
+    video_path = ele["video"].replace("file://", "")
+    nframes = ele["nframes"]
+    alpha = ele["alpha"]
+    select_nframes = int(nframes * alpha)
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"视频文件未找到: {video_path}")
+    if not isinstance(nframes, int) or nframes <= 0:
+        raise ValueError(f"要采样的帧数 'nframes' 必须是一个正整数，但得到的是: {nframes}")
+    try:
+        vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+        total_frames = len(vr)
+        video_fps = vr.get_avg_fps()
+        if nframes > total_frames:
+            print(f"警告：请求采样 {nframes} 帧, 但视频总共只有 {total_frames} 帧。")
+            nframes = total_frames
+        all_idx = np.linspace(0, total_frames, nframes, endpoint=False, dtype=np.int32)
+        random_indices = np.sort(np.random.choice(all_idx, select_nframes, replace=False))
+        idx = random_indices.tolist()
+        video = vr.get_batch(idx).asnumpy()
+        video = torch.from_numpy(video).permute(0, 3, 1, 2)
+        sample_fps = nframes / max(total_frames, 1) * video_fps
+        return video, sample_fps
+    except decord.DECORDError as e:
+        raise RuntimeError(f"使用 decord 读取视频失败: {video_path}") from e
+
+
 import sys
 import warnings
 import math
 import logging
+import time
 from functools import partial
-from transformers import AutoProcessor
-from transformers import Qwen2_5_VLForConditionalGeneration
-from qwen_vl_utils import process_vision_info
-from typing import Any, Dict, List, Optional, Tuple, Union
+
 import torch
 
 from ..base import BaseModel
 from .prompt import Qwen2VLPromptMixin
 from ...smp import get_rank_and_world_size, get_gpu_memory, listinstr
 from ...dataset import DATASET_MODALITY
-
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLCausalLMOutputWithPast,
-    DynamicCache,
-    CrossEntropyLoss
-)
 
 VLLM_MAX_IMAGE_INPUT_NUM = 24
 
@@ -137,88 +172,19 @@ def process_video(video_path, num_frames, min_pixels, max_pixels):
     return images
 
 
-def _apply_repetition_penalty(logits: torch.Tensor, generated_tokens: torch.Tensor, repetition_penalty: float) -> torch.Tensor:
-    """Apply repetition penalty to logits."""
-    batch_size, vocab_size = logits.shape
-    
-    for i in range(batch_size):
-        for token_id in generated_tokens[i].unique():
-            if token_id >= 0 and token_id < vocab_size:  # Valid token
-                if logits[i, token_id] > 0:
-                    logits[i, token_id] = logits[i, token_id] / repetition_penalty
-                else:
-                    logits[i, token_id] = logits[i, token_id] * repetition_penalty
-    
-    return logits
+def setup_visible_devices_per_rank():
+    total_gpus = torch.cuda.device_count()
+    rank, world_size = get_rank_and_world_size()
+    assert world_size == 1, "Only support world_size == 1 for vLLM inference"
+    num_gpus = total_gpus // world_size
+    start_idx = rank * num_gpus
+    assigned_devices = list(range(start_idx, start_idx + num_gpus))
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in assigned_devices)
+    logging.info(f"[Rank {rank}] Visible GPUs: {assigned_devices}")
+    return num_gpus
 
 
-def _apply_top_k_filtering(logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Apply top-k filtering to logits."""
-    if top_k <= 0:
-        return logits
-    
-    top_k = min(top_k, logits.size(-1))
-    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-    logits[indices_to_remove] = float('-inf')
-    return logits
-
-
-def _apply_top_p_filtering(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    """Apply top-p (nucleus) filtering to logits."""
-    if top_p >= 1.0:
-        return logits
-    
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-    
-    # Remove tokens with cumulative probability above the threshold
-    sorted_indices_to_remove = cumulative_probs > top_p
-    # Shift the indices to the right to keep also the first token above the threshold
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = 0
-    
-    # Scatter sorted tensors to original indexing
-    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-    logits[indices_to_remove] = float('-inf')
-    return logits
-
-
-def _sample_next_token(
-    logits, generated_tokens, temperature, top_p, top_k, 
-    repetition_penalty, do_sample
-):
-    """
-    从logits中采样下一个token
-    """
-    # 应用重复惩罚
-    if repetition_penalty != 1.0:
-        logits = _apply_repetition_penalty(logits, generated_tokens, repetition_penalty)
-    
-    # 应用温度
-    if temperature == 0.0:
-        do_sample = False
-    elif temperature != 1.0:
-        logits = logits / temperature
-    
-    # 应用top-k过滤
-    if top_k > 0:
-        logits = _apply_top_k_filtering(logits, top_k)
-    
-    # 应用top-p过滤
-    if top_p < 1.0:
-        logits = _apply_top_p_filtering(logits, top_p)
-    
-    # 采样下一个token
-    if do_sample:
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-    else:
-        next_token = torch.argmax(logits, dim=-1, keepdim=True)
-    
-    return next_token
-
-
-class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
+class ProdecodeQwen2VLFixFrame(Qwen2VLPromptMixin, BaseModel):
     INSTALL_REQ = False
     INTERLEAVE = True
     VIDEO_LLM = True
@@ -242,6 +208,8 @@ class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
         model_config = None,
         **kwargs,
     ):
+        os.environ["FORCE_QWENVL_VIDEO_READER"] = "fix_random_sample"
+        qwen_vl_utils.vision_process.VIDEO_READER_BACKENDS["fix_random_sample"] = sample_fix_random_frames_decord
         super().__init__(use_custom_prompt=use_custom_prompt)
         self.model_config = model_config
         self.min_pixels = min_pixels
@@ -269,9 +237,27 @@ class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
         self.use_audio_in_video = use_audio_in_video
         self.FRAME_FACTOR = 2
         rank, world_size = get_rank_and_world_size()
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
         assert model_path is not None
         self.model_path = model_path
+        MODEL_CLS = None
+
+        if listinstr(['omni'], model_path.lower()):
+            try:
+                from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+            except Exception as err:
+                logging.critical("pip install git+https://github.com/huggingface/transformers@3a1ead0aabed473eafe527915eea8c197d424356")  # noqa: E501
+                raise err
+            MODEL_CLS = Qwen2_5OmniForConditionalGeneration
+            self.processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
+        elif listinstr(['2.5', '2_5', 'qwen25'], model_path.lower()):
+            from transformers import AutoProcessor
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            self.processor = AutoProcessor.from_pretrained(model_path)
+            MODEL_CLS = Qwen2_5_VLForConditionalGeneration
+        else:
+            from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+            MODEL_CLS = Qwen2VLForConditionalGeneration
+            self.processor = Qwen2VLProcessor.from_pretrained(model_path)
 
         gpu_mems = get_gpu_memory()
         max_gpu_mem = max(gpu_mems) if gpu_mems != [] else -1
@@ -279,11 +265,10 @@ class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
         self.use_vllm = kwargs.get('use_vllm', False)
         self.limit_mm_per_prompt = VLLM_MAX_IMAGE_INPUT_NUM
 
-        self.processor = AutoProcessor.from_pretrained(model_path)
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        self.model = MODEL_CLS.from_pretrained(
             model_path,
             torch_dtype='auto',
-            device_map=local_rank,
+            device_map=0,
             attn_implementation='flash_attention_2',
         )
         self.model.eval()
@@ -344,214 +329,111 @@ class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
         return content
 
     def generate_inner_transformers(self, message, dataset=None):
+        try:
+            from qwen_vl_utils import process_vision_info
+        except Exception as err:
+            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")  # noqa: E501
+            raise err
+
         messages = []
         if self.system_prompt is not None:
             messages.append({'role': 'system', 'content': self.system_prompt})
         messages.append({'role': 'user', 'content': self._prepare_content(message, dataset=dataset)})
+        if self.verbose:
+            print(f'\033[31m{messages}\033[0m')
 
-        text = self.processor.apply_chat_template([messages], tokenize=False, add_generation_prompt=True)
-        images, videos = process_vision_info([messages])
-        inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
+        self.generate_kwargs["max_new_tokens"] = 1
+        self.generate_kwargs["do_sample"] = True
+        self.generate_kwargs["top_k"] = None
+        self.generate_kwargs["top_p"] = None
 
+        parallel_messages = []
+        for i in range(2):
+            messages1 = deepcopy(messages)
+            for conv in messages1:
+                for span in conv['content']:
+                    if span['type'] == 'video':
+                        alpha = self.model_config.get(f'alpha{i+1}')
+                        span['nframes'] = int(self.model_config.nframe)
+                        span['alpha'] = alpha
+                        span['total_pixels'] = int(VIDEO_TOTAL_PIXELS * alpha)
+            parallel_messages.append(messages1)
+
+        text = self.processor.apply_chat_template(parallel_messages, tokenize=False, add_generation_prompt=True)
+        images, videos = process_vision_info(parallel_messages)
+        inputs = self.processor(text=text, images=images, videos=videos, padding=True,  padding_side='left', return_tensors='pt')  # noqa: E501
         inputs = inputs.to('cuda')
 
-        breakpoint()
-        generated_ids = self.model.generate(
-            **inputs,
-            **self.generate_kwargs,
-        )
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        out = self.processor.tokenizer.batch_decode(
-            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        response = out[0]
-        breakpoint()
-
-        return response
-
-    def generate_inner(self, message, dataset=None):
-        return self.generate_inner_transformers(message, dataset=dataset)
-
-    @torch.no_grad()
-    def Qwen2_5_VLForConditionalGeneration_generate(
-        wrapper,
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
-        repetition_penalty: float = 1.0,
-        do_sample: bool = True,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        **kwargs,
-    ) -> Union[torch.Tensor, Dict]:
-        position_ids = kwargs.pop("position_ids", None)
-        attention_mask = kwargs.pop("attention_mask", None)
-        
-        option_ids = wrapper.tokenizer(
-            ["A", "B", "C", "D", " A", " B", " C", " D"], 
-            return_tensors="pt"
-        ).input_ids.flatten().to(inputs.device)
-
-        if "inputs_embeds" in kwargs:
-            raise NotImplementedError("`inputs_embeds` is not supported")
-
-        if pad_token_id is None:
-            pad_token_id = getattr(self.config, 'pad_token_id', 0)
-        if eos_token_id is None:
-            eos_token_id = getattr(self.config, 'eos_token_id', 2)
-
-        max_new_tokens = 1  # btnkij
-
-        # 获取图像token位置信息
-        image_token_pos = torch.where(inputs[0] == wrapper.IMAGE_TOKEN_INDEX)[0].item()
-        prefix_len = image_token_pos
-        suffix_len = len(inputs[0]) - image_token_pos - 1
-
-        # 准备多模态输入
-        if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(
-                inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes
-            )
-            # only inputs_embeds is not None
+        if dataset == "LongVideoBench":
+            num_options = 5
         else:
-            inputs_embeds = self.get_model().embed_tokens(inputs)
+            num_options = 4
+        option_ids = self.processor.tokenizer(
+            [chr(ord('A') + i) for i in range(num_options)] + [f" {chr(ord('A') + i)}" for i in range(num_options)], 
+            return_tensors="pt"
+        ).input_ids.flatten().to(inputs.input_ids.device)
 
-        seq_len = inputs_embeds.shape[1]
-        image_len = seq_len - prefix_len - suffix_len
-        total_frame_num = wrapper.model_config.nframe
-        token_per_frame = image_len // total_frame_num
-
-        prefix_embeds = inputs_embeds[:, :prefix_len, :]
-        image_embeds = inputs_embeds[:, prefix_len:prefix_len+image_len, :]
-        suffix_embeds = inputs_embeds[:, prefix_len+image_len:, :]
-
-        random_half = torch.randperm(image_len, device=image_embeds.device) < image_len * wrapper.model_config.alpha1
-        inputs_embeds = torch.cat([prefix_embeds, image_embeds[:, random_half, :], suffix_embeds], dim=1)
-        cache_position = torch.arange(inputs_embeds.shape[1], device=image_embeds.device)
-        last_logits = wrapper._prefill_stage(self, inputs_embeds, cache_position)
-
-        first_option_logits = last_logits[0, option_ids].view(-1, 4).sum(0)
+        torch.cuda.synchronize(0)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(0)
+        start_time = time.time()
+        outputs = self.Qwen2_5_VLForConditionalGeneration_forward(
+            self.model,
+            **inputs,
+        )
+        end_time = time.time()
+        torch.cuda.synchronize(0)
+        peak_mem_stats = torch.cuda.max_memory_allocated(0)
+        last_logits = outputs['logits'][:, -1, :]
+        extra = {
+            "time": end_time - start_time,
+            "peak_mem": peak_mem_stats
+        }
+        
+        first_option_logits = last_logits[0, option_ids].view(-1, num_options).sum(0)
         top2_options = torch.argsort(first_option_logits, descending=True)[:2]
-
-        random_half = torch.randperm(image_len, device=image_embeds.device) < image_len * wrapper.model_config.alpha2
-        inputs_embeds = torch.cat([prefix_embeds, image_embeds[:, random_half, :], suffix_embeds], dim=1)
-        cache_position = torch.arange(inputs_embeds.shape[1], device=image_embeds.device)
-        last_logits = wrapper._prefill_stage(self, inputs_embeds, cache_position)
-
-        second_option_logits = last_logits[0, option_ids].view(-1, 4).sum(0)
+        second_option_logits = last_logits[1, option_ids].view(-1, num_options).sum(0)
         if second_option_logits[top2_options[0]] >= second_option_logits[top2_options[1]]:
             generated_tokens = option_ids[top2_options[0]].unsqueeze(0)
         else:
             generated_tokens = option_ids[top2_options[1]].unsqueeze(0)
 
-        extra_info = {
-            "first_option_logits": first_option_logits.detach().cpu().numpy(),
-            "second_option_logits": second_option_logits.detach().cpu().numpy(),
-        }
-        
-        return generated_tokens, extra_info
-
-    def _prefill_stage(wrapper, self, inputs_embeds, cache_position=None):
-        """
-        Prefill阶段：处理输入序列，生成初始的KV cache和状态
-        """
-        seq_len = inputs_embeds.shape[1]
-        device = inputs_embeds.device
-        
-        # Prefill前向传播 - 处理完整的输入序列
-        if cache_position is None:
-            cache_position = torch.arange(seq_len, device=device)
-        
-        outputs = wrapper.Qwen2ForCausalLM_forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            past_key_values=None,  # 初始时没有cache
-            inputs_embeds=inputs_embeds,
-            use_cache=True,
-            cache_position=cache_position,
-            logits_to_keep=1,  # 只保留最后一个位置的logits
-            return_qkv=False
+        out = self.processor.tokenizer.batch_decode(
+            generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        last_logits = outputs.logits[:, -1, :]
-        
-        return last_logits
+        response = out[0]
 
-    def _inference_stage(
-        wrapper, self, kv, last_logits,
-        max_new_tokens,
-        cache_position,
-        temperature, top_p, top_k, repetition_penalty,
-        do_sample, pad_token_id, eos_token_id
-    ):
-        """
-        Inference阶段：基于prefill的状态进行逐步生成
-        """        
-        batch_size = last_logits.shape[0]
-        device = last_logits.device
+        extra.update({
+            "first_option_logits": first_option_logits.to(torch.float16).detach().cpu().numpy(),
+            "second_option_logits": second_option_logits.to(torch.float16).detach().cpu().numpy(),
+        })
 
-        generated_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
+        if self.post_process:
+            resp = response.split('\\boxed{')[-1]
+            lt = len(resp)
+            counter, end = 1, None
+            for i in range(lt):
+                if resp[i] == '{':
+                    counter += 1
+                elif resp[i] == '}':
+                    counter -= 1
+                if counter == 0:
+                    end = i
+                    break
+                elif i == lt - 1:
+                    end = lt
+                    break
+            if end is not None:
+                response = resp[:end]
 
-        past_key_values = DynamicCache()
-        past_key_values.key_cache, past_key_values.value_cache = kv
-        past_key_values._seen_tokens = current_seq_len = kv[0][0].shape[2]
-        
-        # 逐步生成循环
-        for step in range(max_new_tokens):
-            
-            # ========== Token采样 ==========
-            next_token = _sample_next_token(
-                last_logits, generated_tokens, temperature,
-                top_p, top_k, repetition_penalty, do_sample
-            )
-            
-            # 添加到生成序列
-            generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
-            
-            # 检查是否遇到结束token
-            if torch.all(next_token.squeeze(-1) == eos_token_id):
-                break
-            
-            # ========== 准备下一步的输入 ==========
-            if step < max_new_tokens - 1:  # 不是最后一步
-                
-                # 准备下一步的输入embeddings（只需要最新的token）
-                current_inputs_embeds = self.get_model().embed_tokens(next_token)
-                
-                # 下一步前向传播
-                outputs = wrapper.Qwen2ForCausalLM_forward(
-                    self,
-                    input_ids=None,
-                    attention_mask=None,
-                    position_ids=None,
-                    past_key_values=past_key_values,
-                    inputs_embeds=current_inputs_embeds,
-                    use_cache=True,
-                    cache_position=cache_position,
-                    logits_to_keep=1,
-                )
-                
-                # 更新状态
-                past_key_values = outputs.past_key_values
-                last_logits = outputs.logits[:, -1, :]
-                cache_position = cache_position + 1
-        
-        return generated_tokens
+        if self.verbose:
+            print(f'\033[32m{response}\033[0m')
+        return response, extra
 
-    def Qwen2ForCausalLM_forward(
+    def generate_inner(self, message, dataset=None):
+        return self.generate_inner_transformers(message, dataset=dataset)
+
+    def Qwen2_5_VLForConditionalGeneration_forward(
         wrapper,
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -689,17 +571,28 @@ class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        # video_mask = video_mask[0, :, 0]
+        # drop_indices = torch.where(video_mask)[0]
+        # drop_indices = drop_indices[torch.randperm(len(drop_indices), device=drop_indices.device)]
+        # drop_indices = drop_indices[int(len(drop_indices) * alpha):]
+        # select_mask = torch.ones_like(video_mask)
+        # select_mask[drop_indices] = False
+
+        # position_ids = position_ids[:, :, select_mask]
+        # attention_mask = attention_mask[:, select_mask]
+        # inputs_embeds = inputs_embeds[:, select_mask, :]
+
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            past_key_values=past_key_values,  # None
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cache_position=cache_position,
+            cache_position=cache_position,  # None
         )
 
         hidden_states = outputs[0]
@@ -732,4 +625,3 @@ class ProdecodeQwen2VL(Qwen2VLPromptMixin, BaseModel):
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
-
