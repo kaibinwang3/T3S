@@ -26,9 +26,37 @@ def infer_data_api(model, work_dir, model_name, dataset, samples_dict={}, api_np
     assert getattr(model, 'is_api', False)
 
     indices = list(samples_dict.keys())
-    structs = [dataset.build_prompt(samples_dict[idx], video_llm=getattr(model, 'VIDEO_LLM', False)) for idx in indices]
+    if getattr(model,'backend', None) == 'genai':
+        if dataset.nframe > 0:
+            print(
+                'Gemini model (with genai backend) does not support nframe, '
+                'will set its VIDEO_LLM to False to enable multi-image input for video.'
+            )
+            setattr(model, 'VIDEO_LLM', False)
+        else:
+            print('Gemini model (with genai backend) is a video-llm, '
+                  'will reset fps setting in model to match the dataset.')
+            setattr(model, 'fps', dataset.fps)
+            print(f'The fps is set to {dataset.fps} for the model {model_name}.')
+    elif getattr(model,'backend', None) == 'vertex':
+        print('Gemini model (with vertex backend) does not support video input, '
+              'will set its VIDEO_LLM to False to enable multi-image input for video.')
+        setattr(model, 'VIDEO_LLM', False)
 
     packstr = 'pack' if getattr(dataset, 'pack', False) else 'nopack'
+    build_prompt_input = [(samples_dict[idx], getattr(model, 'VIDEO_LLM', False)) for idx in indices]
+    if dataset.nframe > 0:
+        struct_tmp_file = f'{work_dir}/{model_name}_{dataset_name}_{dataset.nframe}frame_{packstr}_structs.pkl'
+    else:
+        struct_tmp_file = f'{work_dir}/{model_name}_{dataset_name}_{dataset.fps}fps_{packstr}_structs.pkl'
+    structs = track_progress_rich(
+        dataset.build_prompt,
+        tasks=build_prompt_input,
+        nproc=api_nproc,
+        save=struct_tmp_file,
+        keys=indices,
+    )
+
     if dataset.nframe > 0:
         out_file = f'{work_dir}/{model_name}_{dataset_name}_{dataset.nframe}frame_{packstr}_supp.pkl'
     else:
@@ -36,6 +64,7 @@ def infer_data_api(model, work_dir, model_name, dataset, samples_dict={}, api_np
     res = load(out_file) if osp.exists(out_file) else {}
 
     structs = [s for i, s in zip(indices, structs) if i not in res or res[i] == FAIL_MSG]
+    structs = [struct for struct in structs if struct is not None]
     indices = [i for i in indices if i not in res or res[i] == FAIL_MSG]
 
     gen_func = model.generate
@@ -107,7 +136,15 @@ def infer_data(
         or 'Qwen2.5-Omni' in model_name
     ):
         kwargs['use_vllm'] = use_vllm
+
+    # (25.06.05) In newer version of transformers (after 4.50), with device_map='auto' and torchrun launcher,
+    # Transformers automatically adopt TP parallelism, which leads to compatibility problems with VLMEvalKit
+    # (In VLMEvalKit, we use torchrun to launch multiple model instances on a single node).
+    # To bypass this problem, we unset `WORLD_SIZE` before building the model to not use TP parallel.
+    ws_bak = os.environ.pop('WORLD_SIZE', None)
     model = supported_VLM[model_name](model_config=model_config, **kwargs) if isinstance(model, str) else model
+    if ws_bak:
+        os.environ['WORLD_SIZE'] = ws_bak
 
     is_api = getattr(model, 'is_api', False)
     if is_api:
@@ -126,6 +163,13 @@ def infer_data(
         return model
 
     assert not getattr(dataset, 'pack', False), 'Current model not supported pack mode!'
+    if 'megabench' in dataset_name.lower() and 'llava_onevision' in model_name:
+        print(
+            'LLaVA-OneVision does not support Megabench dataset as video dataset, '
+            'will set its VIDEO_LLM to False to enable multi-image input for video.'
+        )
+        setattr(model, 'VIDEO_LLM', False)
+
     for i, idx in tqdm(enumerate(sample_indices_subrem)):
         if idx in res:
             continue
@@ -147,10 +191,15 @@ def infer_data(
                 raise ValueError(f'nframe is not suitable for {model_name}')
             else:
                 setattr(model, 'fps', None)
-        if getattr(model, 'nframe', None) is None and dataset.nframe > 0:
-            print(f'using {model_name} default setting for video, dataset.nframe is ommitted')
-        if getattr(model, 'fps', None) is None and dataset.fps > 0:
-            print(f'using {model_name} default setting for video, dataset.fps is ommitted')
+        if (
+            'Qwen2-VL' in model_name
+            or 'Qwen2.5-VL' in model_name
+            or 'Qwen2.5-Omni' in model_name
+        ):
+            if getattr(model, 'nframe', None) is None and dataset.nframe > 0:
+                print(f'using {model_name} default setting for video, dataset.nframe is ommitted')
+            if getattr(model, 'fps', None) is None and dataset.fps > 0:
+                print(f'using {model_name} default setting for video, dataset.fps is ommitted')
         if 'SUB_DATASET' in dataset.data.iloc[sample_map[idx]]:
             dataset_name = dataset.data.iloc[sample_map[idx]]['SUB_DATASET']
         if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
@@ -163,7 +212,20 @@ def infer_data(
             struct = dataset.build_prompt(
                 sample_map[idx], video_llm=getattr(model, 'VIDEO_LLM', False)
             )
-        response = model.generate(message=struct, dataset=dataset_name)
+        if struct is None:
+            continue
+
+        # If `SKIP_ERR` flag is set, the model will skip the generation if error is encountered
+        if os.environ.get('SKIP_ERR', False) == '1':
+            FAIL_MSG = 'Failed to obtain answer'
+            try:
+                response = model.generate(message=struct, dataset=dataset_name)
+            except RuntimeError as err:
+                torch.cuda.synchronize()
+                warnings.error(f'{type(err)} {str(err)}')
+                response = f'{FAIL_MSG}: {type(err)} {str(err)}'
+        else:
+            response = model.generate(message=struct, dataset=dataset_name)
 
         if isinstance(response, tuple):
             response, extra = response

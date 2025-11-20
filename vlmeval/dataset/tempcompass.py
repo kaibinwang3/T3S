@@ -8,7 +8,6 @@ from ..utils import track_progress_rich
 import torchvision.transforms as T
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
-from decord import VideoReader, cpu
 from .utils.tempcompass import *
 
 
@@ -26,9 +25,8 @@ class TempCompass(ConcatVideoDataset):
 
     def evaluate(self, eval_file, **judge_kwargs):
         result = super().evaluate(eval_file=eval_file, **judge_kwargs)
-        suffix = eval_file.split('.')[-1]
         result = result.reset_index().rename(columns={'index': 'dim.task_type'})
-        score_file = eval_file.replace(f'.{suffix}', '_acc.csv')
+        score_file = get_intermediate_file_path(eval_file, '_acc', 'csv')
         avg_dict = {}
         for idx, item in result.iterrows():
             dim, task_type = item['dim.task_type'].split('. ')
@@ -150,6 +148,7 @@ class TempCompass_MCQ(VideoBaseDataset):
 
     def save_video_frames(self, line):
         vid_path = osp.join(self.data_root, line['prefix'], line['video'] + line['suffix'])
+        import decord
         vid = decord.VideoReader(vid_path)
         video_info = {
             'fps': vid.get_avg_fps(),
@@ -170,11 +169,14 @@ class TempCompass_MCQ(VideoBaseDataset):
         flag = np.all([osp.exists(p) for p in frame_paths])
 
         if not flag:
-            images = [vid[i].asnumpy() for i in indices]
-            images = [Image.fromarray(arr) for arr in images]
-            for im, pth in zip(images, frame_paths):
-                if not osp.exists(pth):
-                    im.save(pth)
+            lock_path = osp.splitext(vid_path)[0] + '.lock'
+            with portalocker.Lock(lock_path, 'w', timeout=30):
+                if not np.all([osp.exists(p) for p in frame_paths]):
+                    images = [vid[i].asnumpy() for i in indices]
+                    images = [Image.fromarray(arr) for arr in images]
+                    for im, pth in zip(images, frame_paths):
+                        if not osp.exists(pth):
+                            im.save(pth)
 
         return frame_paths
 
@@ -189,7 +191,6 @@ class TempCompass_MCQ(VideoBaseDataset):
 
         question, answer = self.qa_template(line)
         message = []
-        message.append(dict(type='text', value=question))
         video_path = osp.join(self.data_root, line['prefix'], line['video'] + line['suffix'])
         if video_llm:
             message.append(dict(type='video', value=video_path))
@@ -197,6 +198,7 @@ class TempCompass_MCQ(VideoBaseDataset):
             img_frame_paths = self.save_video_into_images(line)
             for im in img_frame_paths:
                 message.append(dict(type='image', value=im))
+        message.append(dict(type='text', value=question))
         message.append(dict(type='text', value='\nPlease directly give the best option:'))
         return message
 
@@ -211,9 +213,8 @@ class TempCompass_MCQ(VideoBaseDataset):
             "presence_penalty": 1,
         })
 
-        suffix = eval_file.split('.')[-1]
-        score_file = eval_file.replace(f'.{suffix}', f'_{model}_score.xlsx')
-        tmp_file = eval_file.replace(f'.{suffix}', f'_{model}.pkl')
+        score_file = get_intermediate_file_path(eval_file, f'_{model}_score')
+        tmp_file = get_intermediate_file_path(eval_file, f'_{model}', 'pkl')
         nproc = judge_kwargs.pop('nproc', 4)
 
         if not osp.exists(score_file):
@@ -345,6 +346,7 @@ class TempCompass_Captioning(VideoBaseDataset):
 
     def save_video_frames(self, line):
         vid_path = osp.join(self.data_root, line['prefix'], line['video'] + line['suffix'])
+        import decord
         vid = decord.VideoReader(vid_path)
         video_info = {
             'fps': vid.get_avg_fps(),
@@ -365,11 +367,14 @@ class TempCompass_Captioning(VideoBaseDataset):
         flag = np.all([osp.exists(p) for p in frame_paths])
 
         if not flag:
-            images = [vid[i].asnumpy() for i in indices]
-            images = [Image.fromarray(arr) for arr in images]
-            for im, pth in zip(images, frame_paths):
-                if not osp.exists(pth):
-                    im.save(pth)
+            lock_path = osp.splitext(vid_path)[0] + '.lock'
+            with portalocker.Lock(lock_path, 'w', timeout=30):
+                if not np.all([osp.exists(p) for p in frame_paths]):
+                    images = [vid[i].asnumpy() for i in indices]
+                    images = [Image.fromarray(arr) for arr in images]
+                    for im, pth in zip(images, frame_paths):
+                        if not osp.exists(pth):
+                            im.save(pth)
 
         return frame_paths
 
@@ -384,7 +389,6 @@ class TempCompass_Captioning(VideoBaseDataset):
 
         question, answer = self.qa_template(line)
         message = []
-        message.append(dict(type='text', value=question))
         video_path = osp.join(self.data_root, line['prefix'], line['video'] + line['suffix'])
         if video_llm:
             message.append(dict(type='video', value=video_path))
@@ -392,6 +396,7 @@ class TempCompass_Captioning(VideoBaseDataset):
             img_frame_paths = self.save_video_into_images(line)
             for im in img_frame_paths:
                 message.append(dict(type='image', value=im))
+        message.append(dict(type='text', value=question))
         return message
 
     @classmethod
@@ -405,9 +410,8 @@ class TempCompass_Captioning(VideoBaseDataset):
             "presence_penalty": 1,
         })
 
-        suffix = eval_file.split('.')[-1]
-        score_file = eval_file.replace(f'.{suffix}', f'_{model}_score.xlsx')
-        tmp_file = eval_file.replace(f'.{suffix}', f'_{model}.pkl')
+        score_file = get_intermediate_file_path(eval_file, f'_{model}_score')
+        tmp_file = get_intermediate_file_path(eval_file, f'_{model}', 'pkl')
         nproc = judge_kwargs.pop('nproc', 4)
 
         if not osp.exists(score_file):
@@ -537,6 +541,7 @@ class TempCompass_YorN(VideoBaseDataset):
 
     def save_video_frames(self, line):
         vid_path = osp.join(self.data_root, line['prefix'], line['video'] + line['suffix'])
+        import decord
         vid = decord.VideoReader(vid_path)
         video_info = {
             'fps': vid.get_avg_fps(),
@@ -557,11 +562,14 @@ class TempCompass_YorN(VideoBaseDataset):
         flag = np.all([osp.exists(p) for p in frame_paths])
 
         if not flag:
-            images = [vid[i].asnumpy() for i in indices]
-            images = [Image.fromarray(arr) for arr in images]
-            for im, pth in zip(images, frame_paths):
-                if not osp.exists(pth):
-                    im.save(pth)
+            lock_path = osp.splitext(vid_path)[0] + '.lock'
+            with portalocker.Lock(lock_path, 'w', timeout=30):
+                if not np.all([osp.exists(p) for p in frame_paths]):
+                    images = [vid[i].asnumpy() for i in indices]
+                    images = [Image.fromarray(arr) for arr in images]
+                    for im, pth in zip(images, frame_paths):
+                        if not osp.exists(pth):
+                            im.save(pth)
 
         return frame_paths
 
@@ -576,7 +584,6 @@ class TempCompass_YorN(VideoBaseDataset):
 
         question, answer = self.qa_template(line)
         message = []
-        message.append(dict(type='text', value=question))
         video_path = osp.join(self.data_root, line['prefix'], line['video'] + line['suffix'])
         if video_llm:
             message.append(dict(type='video', value=video_path))
@@ -584,6 +591,7 @@ class TempCompass_YorN(VideoBaseDataset):
             img_frame_paths = self.save_video_into_images(line)
             for im in img_frame_paths:
                 message.append(dict(type='image', value=im))
+        message.append(dict(type='text', value=question))
         message.append(dict(type='text', value='\nPlease answer yes or no:'))
         return message
 
@@ -598,9 +606,8 @@ class TempCompass_YorN(VideoBaseDataset):
             "presence_penalty": 1,
         })
 
-        suffix = eval_file.split('.')[-1]
-        score_file = eval_file.replace(f'.{suffix}', f'_{model}_score.xlsx')
-        tmp_file = eval_file.replace(f'.{suffix}', f'_{model}.pkl')
+        score_file = get_intermediate_file_path(eval_file, f'_{model}_score')
+        tmp_file = get_intermediate_file_path(eval_file, f'_{model}', 'pkl')
         nproc = judge_kwargs.pop('nproc', 4)
 
         if not osp.exists(score_file):

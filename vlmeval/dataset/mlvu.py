@@ -1,6 +1,7 @@
 import huggingface_hub
 from huggingface_hub import snapshot_download
 from ..smp import *
+from ..smp.file import get_intermediate_file_path
 from .video_concat_dataset import ConcatVideoDataset
 from .video_base import VideoBaseDataset
 from .utils import build_judge, DEBUG_MESSAGE
@@ -8,7 +9,6 @@ from ..utils import track_progress_rich
 import torchvision.transforms as T
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
-from decord import VideoReader, cpu
 import pandas as pd
 import imageio
 import cv2
@@ -24,7 +24,7 @@ class MLVU(ConcatVideoDataset):
     def __init__(self, dataset='MLVU', nframe=0, fps=-1):
         self.DATASET_SETS[dataset] = ['MLVU_MCQ', 'MLVU_OpenEnded']
         self.type_data_dict = {
-            'M-Avg':['plotQA', 'needle', 'ego', 'count', 'anomaly_reco', 'topic_reasoning'],
+            'M-Avg':['plotQA', 'needle', 'ego', 'count', 'anomaly_reco', 'topic_reasoning', 'order'],
             'G-Avg':['sub_scene', 'summary']
         }
         super().__init__(dataset=dataset, nframe=nframe, fps=fps)
@@ -35,8 +35,7 @@ class MLVU(ConcatVideoDataset):
 
     def evaluate(self, eval_file, **judge_kwargs):
         result = super().evaluate(eval_file=eval_file, **judge_kwargs)
-        suffix = eval_file.split('.')[-1]
-        score_file = eval_file.replace(f'.{suffix}', '_acc.csv')
+        score_file = get_intermediate_file_path(eval_file, '_acc')
         for key in self.type_data_dict:
             result.loc[key] = 0.0
             for name, item in result.iterrows():
@@ -157,6 +156,7 @@ class MLVU_MCQ(VideoBaseDataset):
         suffix = line['video'].split('.')[-1]
         video = line['video'].replace(f'.{suffix}','')
         vid_path = osp.join(self.data_root, line['prefix'], line['video'])
+        import decord
         vid = decord.VideoReader(vid_path)
         video_info = {
             'fps': vid.get_avg_fps(),
@@ -177,11 +177,14 @@ class MLVU_MCQ(VideoBaseDataset):
         flag = np.all([osp.exists(p) for p in frame_paths])
 
         if not flag:
-            images = [vid[i].asnumpy() for i in indices]
-            images = [Image.fromarray(arr) for arr in images]
-            for im, pth in zip(images, frame_paths):
-                if not osp.exists(pth):
-                    im.save(pth)
+            lock_path = osp.splitext(vid_path)[0] + '.lock'
+            with portalocker.Lock(lock_path, 'w', timeout=30):
+                if not np.all([osp.exists(p) for p in frame_paths]):
+                    images = [vid[i].asnumpy() for i in indices]
+                    images = [Image.fromarray(arr) for arr in images]
+                    for im, pth in zip(images, frame_paths):
+                        if not osp.exists(pth):
+                            im.save(pth)
 
         return frame_paths
 
@@ -210,10 +213,10 @@ class MLVU_MCQ(VideoBaseDataset):
 
     @classmethod
     def evaluate(self, eval_file, **judge_kwargs):
-        assert eval_file.endswith('.xlsx'), 'data file should be an xlsx file'
+        assert get_file_extension(eval_file) in ['xlsx', 'json', 'tsv'], 'data file should be an supported format (xlsx/json/tsv) file'  # noqa: E501
 
-        tmp_file = eval_file.replace('.xlsx', '_tmp.pkl')
-        score_file = eval_file.replace('.xlsx', '_score.xlsx')
+        tmp_file = get_intermediate_file_path(eval_file, '_tmp', 'pkl')
+        score_file = get_intermediate_file_path(eval_file, '_score')
 
         if not osp.exists(score_file):
             model = judge_kwargs.setdefault('model', 'chatgpt-0125')
@@ -361,6 +364,7 @@ class MLVU_OpenEnded(VideoBaseDataset):
         suffix = line['video'].split('.')[-1]
         video = line['video'].replace(f'.{suffix}','')
         vid_path = osp.join(self.data_root, line['prefix'], line['video'])
+        import decord
         vid = decord.VideoReader(vid_path)
         video_info = {
             'fps': vid.get_avg_fps(),
@@ -381,11 +385,14 @@ class MLVU_OpenEnded(VideoBaseDataset):
         flag = np.all([osp.exists(p) for p in frame_paths])
 
         if not flag:
-            images = [vid[i].asnumpy() for i in indices]
-            images = [Image.fromarray(arr) for arr in images]
-            for im, pth in zip(images, frame_paths):
-                if not osp.exists(pth):
-                    im.save(pth)
+            lock_path = osp.splitext(vid_path)[0] + '.lock'
+            with portalocker.Lock(lock_path, 'w', timeout=30):
+                if not np.all([osp.exists(p) for p in frame_paths]):
+                    images = [vid[i].asnumpy() for i in indices]
+                    images = [Image.fromarray(arr) for arr in images]
+                    for im, pth in zip(images, frame_paths):
+                        if not osp.exists(pth):
+                            im.save(pth)
 
         return frame_paths
 
@@ -400,7 +407,6 @@ class MLVU_OpenEnded(VideoBaseDataset):
 
         question, answer = self.qa_template(line)
         message = [dict(type='text', value=self.SYS, role='system')]
-        message.append(dict(type='text', value=question))
         video_path = os.path.join(self.data_root, line['prefix'], line['video'])
         if video_llm:
             message.append(dict(type='video', value=video_path))
@@ -408,6 +414,7 @@ class MLVU_OpenEnded(VideoBaseDataset):
             img_frame_paths = self.save_video_into_images(line)
             for im in img_frame_paths:
                 message.append(dict(type='image', value=im))
+        message.append(dict(type='text', value=question))
         return message
 
     @classmethod
@@ -418,9 +425,8 @@ class MLVU_OpenEnded(VideoBaseDataset):
             print('MLVU Open Ended default using gpt-4-0125! So judge model is changed to gpt-4-0125')
             judge_kwargs['model'] = 'gpt-4-0125'
 
-        suffix = eval_file.split('.')[-1]
-        score_file = eval_file.replace(f'.{suffix}', f'_{model}_score.xlsx')
-        tmp_file = eval_file.replace(f'.{suffix}', f'_{model}.pkl')
+        score_file = get_intermediate_file_path(eval_file, f'_{model}_score')
+        tmp_file = get_intermediate_file_path(eval_file, f'_{model}', 'pkl')
         nproc = judge_kwargs.pop('nproc', 4)
 
         if not osp.exists(score_file):

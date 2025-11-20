@@ -47,7 +47,8 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
 
     # To reuse records in MMBench_V11
     if dataset_name in ['MMBench', 'MMBench_CN']:
-        v11_pred = f'{work_dir}/{model_name}_{dataset_name}_V11.xlsx'
+        pred_format = get_pred_file_format()
+        v11_pred = f'{work_dir}/{model_name}_{dataset_name}_V11.{pred_format}'
         if osp.exists(v11_pred):
             try:
                 reuse_inds = load('http://opencompass.openxlab.space/utils/mmb_reuse.pkl')
@@ -115,7 +116,15 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         or 'Qwen2.5-VL' in model_name
     ):
         kwargs = {'use_vllm': use_vllm}
+
+    # (25.06.05) In newer version of transformers (after 4.50), with device_map='auto' and torchrun launcher,
+    # Transformers automatically adopt TP parallelism, which leads to compatibility problems with VLMEvalKit
+    # (In VLMEvalKit, we use torchrun to launch multiple model instances on a single node).
+    # To bypass this problem, we unset `WORLD_SIZE` before building the model to not use TP parallel.
+    ws_bak = os.environ.pop('WORLD_SIZE', None)
     model = supported_VLM[model_name](**kwargs) if isinstance(model, str) else model
+    if ws_bak:
+        os.environ['WORLD_SIZE'] = ws_bak
 
     is_api = getattr(model, 'is_api', False)
     if is_api:
@@ -146,7 +155,17 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         else:
             struct = dataset.build_prompt(data.iloc[i])
 
-        response = model.generate(message=struct, dataset=dataset_name)
+        # If `SKIP_ERR` flag is set, the model will skip the generation if error is encountered
+        if os.environ.get('SKIP_ERR', False) == '1':
+            FAIL_MSG = 'Failed to obtain answer'
+            try:
+                response = model.generate(message=struct, dataset=dataset_name)
+            except RuntimeError as err:
+                torch.cuda.synchronize()
+                warnings.warn(f'{type(err)} {str(err)}')
+                response = f'{FAIL_MSG}: {type(err)} {str(err)}'
+        else:
+            response = model.generate(message=struct, dataset=dataset_name)
         torch.cuda.empty_cache()
 
         if verbose:
@@ -167,12 +186,14 @@ def infer_data_job(
 ):
     rank, world_size = get_rank_and_world_size()
     dataset_name = dataset.dataset_name
-    result_file = osp.join(work_dir, f'{model_name}_{dataset_name}.xlsx')
+    # 使用环境变量控制的文件格式
+    result_file = get_pred_file_path(work_dir, model_name, dataset_name, use_env_format=True)
 
     prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
     if osp.exists(result_file):
         if rank == 0:
             data = load(result_file)
+            # breakpoint()
             results = {k: v for k, v in zip(data['index'], data['prediction'])}
             if not ignore_failed:
                 results = {k: v for k, v in results.items() if FAIL_MSG not in str(v)}
@@ -197,7 +218,30 @@ def infer_data_job(
         data = dataset.data
         for x in data['index']:
             assert x in data_all
-        data['prediction'] = [str(data_all[x]) for x in data['index']]
+        if os.getenv('SPLIT_THINK', False):
+            prediction = [str(data_all[x]) for x in data['index']]
+
+            def split_thinking(s):
+                if '</think>' in s:
+                    splits = s.split('</think>')
+                    prediction = splits[-1].strip()
+                    if len(splits) == 2 and '<think>' in splits[0]:
+                        thinking = splits[0].split('<think>')[1].strip()
+                    else:
+                        thinking = '</think>'.join(splits[:-1])
+                        thinking += '</think>'
+                        warnings.warn('Failed to parse thinking, multiple </think> tags or missing <think> tag.')
+                else:
+                    thinking = ''
+                    prediction = s
+                return (prediction, thinking)
+            split_func = model.split_thinking if hasattr(model, 'split_thinking') else split_thinking
+            print(f'Prediction format: {os.getenv("SPLIT_THINK")},splitting func: {split_func}')
+            tups = [split_func(x) for x in prediction]
+            data['prediction'] = [x[0] for x in tups]
+            data['thinking'] = [x[1] for x in tups]
+        else:
+            data['prediction'] = [str(data_all[x]) for x in data['index']]
         if 'image' in data:
             data.pop('image')
 

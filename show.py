@@ -463,10 +463,7 @@ def grid_search():
 
 
 def show_single():
-    # root = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250717-qwenvl-prodecode_randframe_frame_logits-nframe256-alpha1_alpha2_0.5_0.3/prodecode_qwen2vl_randframe_frame_logits"
-    root = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251030-qwenvl-prodecode_randframe_token_logits_pack-nframe256-alpha_0.5_0.3/prodecode_qwen2vl_randframe_token_logits_pack"
-    # root = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251030-llavavideo-randframe-token_logits_pack-nframe128-alpha_0.2_0.5_0.2_0.5/prodecode_llava_randframe_token_logits_pack"
-    # root = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251030-oryx_randframe_token_pack-nframe256-alpha_0.4_0.4_0.4_0.4/prodecode_oryx_randframe_token_logits_pack"
+    root = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251116-vtw_qwen3vl30b-nframe128-K24/vtw_qwen3vl30b"
     for dataset in [
             "VideoMME",
             "LongVideoBench",
@@ -476,29 +473,94 @@ def show_single():
         result, extra, details = show(root, dataset)
         print(result)
 
-        baseline_result, baseline_extra, baseline_details = show(
-            "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251031-qwenvl-baseline_logits-nframe256/baseline_qwen2vl_logits",
-            # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250704-llavavideo-baseline_logits-nframe128/baseline_llava_logits",
-            # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250708-oryx-baseline_logits-nframe256/baseline_oryx_logits",
-            dataset
-        )
-        print(details[0], baseline_details[0])
-        print(baseline_extra['total_time'] / extra['total_time'])
-        # print((baseline_extra['peak_mem'] - extra['peak_mem']) / baseline_extra['peak_mem'])
-        print()
+        # baseline_result, baseline_extra, baseline_details = show(
+        #     "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251031-qwenvl-baseline_logits-nframe256/baseline_qwen2vl_logits",
+        #     # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250704-llavavideo-baseline_logits-nframe128/baseline_llava_logits",
+        #     # "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250708-oryx-baseline_logits-nframe256/baseline_oryx_logits",
+        #     dataset
+        # )
+        # print(details[0], baseline_details[0])
+        # print(baseline_extra['total_time'] / extra['total_time'])
+        # # print((baseline_extra['peak_mem'] - extra['peak_mem']) / baseline_extra['peak_mem'])
+        # print()
+
+
+def grid_search_qwen3vl():
+    root_tmpl = "/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251117-prodecode_qwen3vl30b_randframe_token_logits-nframe64-alpha1_alpha2_{}_{}"
+    # dataset = "VideoMME"
+    # dataset = "LongVideoBench"
+    dataset = "MLVU"
+
+    logits = {}
+    gt = []
+    alpha_space = ['0.1', '0.2', '0.3', '0.4', '0.5', '0.6']
+    for alpha in alpha_space:
+        print(alpha)
+        root = root_tmpl.format(alpha, alpha)
+        result, extra, details = show(root, dataset)
+        logits[alpha] = []
+        for detail in details:
+            logits[alpha].append([detail['first_option_logits'], detail['second_option_logits']])
+            if len(gt) < len(logits[alpha]):
+                gt.append(detail['gt'])
+
+    # logits['0.6'] = []
+    # result, extra, details1 = show("/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251109-prodecode_qwen3vl_randframe_token_logits-nframe256-alpha1_alpha2_0.1_0.6", dataset)
+    # result, extra, details2 = show("/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251109-prodecode_qwen3vl_randframe_token_logits-nframe256-alpha1_alpha2_0.6_0.1", dataset)
+    # for detail1, detail2 in zip(details1, details2):
+    #     logits['0.6'].append([detail2['first_option_logits'], detail1['second_option_logits']])
+    #     if len(gt) < len(logits[alpha]):
+    #         gt.append(detail['gt'])
+    # alpha_space.append('0.6')
+
+    best_acc = 0
+    best_alpha1 = best_alpha2 = 0
+    for i in range(len(alpha_space) * 2):
+        for j in range(len(alpha_space) * 2):
+            if i == j:
+                continue
+            alpha1 = str(alpha_space[i // 2])
+            alpha2 = str(alpha_space[j // 2])
+            logits1 = logits[alpha1]
+            logits2 = logits[alpha2]
+            print(alpha1, alpha2, len(logits1), len(logits2))
+            total = correct = 0
+            for idx, (first, second) in enumerate(zip(logits1, logits2)):
+                first = first[i%2]
+                second = second[i%2]
+                merged = first + second
+                # merged = stable_softmax(first) + stable_softmax(second)
+                # merged = stable_softmax(first) * stable_softmax(second)
+                # merged = first
+                answer = np.argmax(merged)
+                # top2 = np.argsort(first)[-2:]
+                # answer = top2[0] if second[top2[0]] >= second[top2[1]] else top2[1]
+                total += 1
+                correct += int(answer == gt[idx])
+            acc = correct / total
+            # if acc > 0.570:
+            print('#', acc, alpha1, alpha2)
+            if acc > best_acc or acc == best_acc and float(alpha1) + float(alpha2) < best_alpha1 + best_alpha2:
+                best_acc = acc
+                best_alpha1 = float(alpha1)
+                best_alpha2 = float(alpha2)
+    print(best_acc, best_alpha1, best_alpha2)
 
 
 if __name__ == "__main__":
-    show_single()
+    # show_single()
     # show_avg_metrics()
     # show_poe_metrics()
     # show_entropy_metrics()
     # show_20250625_qwenvl_prodecode_nframe256_alpha1_alpha2()
     # show_20250628_qwenvl_prodecode_nframe128x2_alpha1_alpha2()
     # grid_search()
-    # show_merge(
-    #     '/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250725-oryx-randframe-token-nframe256-alpha1_alpha2_0.6_0.6', 2,
-    #     '/mnt/afs/wangkaibin/VLMEvalKit/outputs/20250725-oryx-randframe-token-nframe256-alpha1_alpha2_0.3_0.3', 2,
-    #     'MLVU'
-    # )
+    show_merge(
+        '/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251117-prodecode_qwen3vl30b_randframe_token_logits-nframe64-alpha1_alpha2_0.5_0.5', 2,
+        '/mnt/afs/wangkaibin/VLMEvalKit/outputs/20251117-prodecode_qwen3vl30b_randframe_token_logits-nframe64-alpha1_alpha2_0.6_0.6', 2,
+        "VideoMME",
+        # "LongVideoBench",
+        # 'MLVU',
+    )
     # show_ablation_bsz()
+    # grid_search_qwen3vl()

@@ -36,15 +36,14 @@ class OpenAIWrapper(BaseAPI):
     def __init__(self,
                  model: str = 'gpt-3.5-turbo-0613',
                  retry: int = 5,
-                 wait: int = 5,
                  key: str = None,
                  verbose: bool = False,
                  system_prompt: str = None,
                  temperature: float = 0,
-                 timeout: int = 60,
+                 timeout: int = 300,
                  api_base: str = None,
                  max_tokens: int = 2048,
-                 img_size: int = 512,
+                 img_size: int = -1,
                  img_detail: str = 'low',
                  use_azure: bool = False,
                  **kwargs):
@@ -80,6 +79,18 @@ class OpenAIWrapper(BaseAPI):
             env_key = os.environ.get('XAI_API_KEY', '')
             if key is None:
                 key = env_key
+        elif 'gemini' in model and 'preview' in model:
+            # Will only handle preview models
+            env_key = os.environ.get('GOOGLE_API_KEY', '')
+            if key is None:
+                key = env_key
+            api_base = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        elif 'ernie' in model:
+            env_key = os.environ.get('BAIDU_API_KEY', '')
+            if key is None:
+                key = env_key
+            api_base = 'https://qianfan.baidubce.com/v2/chat/completions'
+            self.baidu_appid = os.environ.get('BAIDU_APP_ID', None)
         else:
             if use_azure:
                 env_key = os.environ.get('AZURE_OPENAI_API_KEY', None)
@@ -105,9 +116,9 @@ class OpenAIWrapper(BaseAPI):
         assert img_detail in ['high', 'low']
         self.img_detail = img_detail
         self.timeout = timeout
-        self.o1_model = 'o1' in model or 'o3' in model
-
-        super().__init__(wait=wait, retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
+        self.is_max_completion_tokens = ('o1' in model) or ('o3' in model) or ('o4' in model) or ('gpt-5' in model)
+        self.is_o_model = ('o1' in model) or ('o3' in model) or ('o4' in model)
+        super().__init__(retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
 
         if use_azure:
             api_base_template = (
@@ -142,6 +153,9 @@ class OpenAIWrapper(BaseAPI):
             else:
                 self.logger.error('Unknown API Base. ')
                 raise NotImplementedError
+            if os.environ.get('BOYUE', None):
+                self.api_base = os.environ.get('BOYUE_API_BASE')
+                self.key = os.environ.get('BOYUE_API_KEY')
 
         self.logger.info(f'Using API Base: {self.api_base}; API Key: {self.key}')
 
@@ -193,19 +207,26 @@ class OpenAIWrapper(BaseAPI):
             headers = {'Content-Type': 'application/json', 'Authorization': self.key}
         else:
             headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {self.key}'}
+        if hasattr(self, 'baidu_appid'):
+            headers['appid'] = self.baidu_appid
+
         payload = dict(
             model=self.model,
             messages=input_msgs,
-            # max_tokens=max_tokens,
             n=1,
             temperature=temperature,
             **kwargs)
 
-        if self.o1_model:
+        if self.is_max_completion_tokens:
             payload['max_completion_tokens'] = max_tokens
             payload.pop('temperature')
         else:
             payload['max_tokens'] = max_tokens
+
+        if 'gemini' in self.model:
+            payload.pop('max_tokens')
+            payload.pop('n')
+            payload['reasoning_effort'] = 'high'
 
         response = requests.post(
             self.api_base,

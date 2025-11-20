@@ -118,6 +118,20 @@ def get_local_rank_and_local_world_size():
     )
 
 
+def build_yesorno_cot_prompt(line, prompt, cot_prompt=None):
+    if cot_prompt is None:
+        cot_prompt = (
+            "Answer the preceding yes-or-no question. Think step by step logically, considering all "
+            "relevant information before answering. If you are uncertain or the problem is ambiguous, make a "
+            "reasoned guess based on the information provided. The last line of your response must be exactly "
+            "in this format: 'Answer: \\boxed{Yes}' or 'Answer: \\boxed{No}' (without quotes)."
+        )
+    prompt = prompt.replace("Please answer yes or no. Answer the question using a single word or phrase.", '').strip()
+    prompt = prompt + '\n' + cot_prompt
+
+    return prompt
+
+
 def build_mcq_cot_prompt(line, prompt, cot_prompt=None):
     if cot_prompt is None:
         cot_prompt = (
@@ -197,6 +211,16 @@ def reorganize_prompt(message, image_num, dataset=None):
         for i in range(image_num):
             prompt = prompt.replace('<image>', f'<Image-{i + 1}>', 1)
         prompt = ''.join([f'Image-{i + 1}: <image>\n' for i in range(image_num)]) + prompt
+    elif dataset is not None and listinstr(["bmmr"], dataset.lower()):
+        if image_num == 1:
+            prompt = "\n".join([x["value"] for x in message if x["type"] == "text"])
+        else:
+            prompt, image_idx = "", 1
+            for x in message:
+                if x["type"] == "text":
+                    prompt += x["value"]
+                elif x["type"] == "image":
+                    image_idx += 1
     elif image_num == 1:
         prompt = '<image>\n' + '\n'.join([x['value'] for x in message if x['type'] == 'text'])
     else:
@@ -246,6 +270,19 @@ def mpo_post_processing(response, dataset):
     return response
 
 
+def parse_bbox_internvl(response):
+    # 使用正则表达式匹配bounding box
+    # pattern = r"<box>\[\[(\d+), (\d+), (\d+), (\d+)\]\]</box>"
+    pattern = r"\[\[(\d+), (\d+), (\d+), (\d+)\]\]"
+    match = re.search(pattern, response)
+    if match:
+        # 提取匹配到的坐标值并转换为整数
+        x1, y1, x2, y2 = map(int, match.groups())
+        return [(x1 + x2) / 2, (y1 + y2) / 2]
+    else:
+        return response
+
+
 def build_mpo_prompt(message, line, dataset):
     if listinstr(['LLaVABench', 'MMVet'], dataset):
         return message
@@ -272,3 +309,18 @@ def build_mpo_prompt(message, line, dataset):
     prompt = cot_prompt.format(question=question_orig).strip()
     message[0]['value'] = prompt
     return message
+
+
+def format_nav_prompt(template, placeholders, **kwargs):
+    prompt = template
+    for placeholder in placeholders:
+        value = kwargs.get(placeholder, '')
+        prompt = prompt.replace(f"{{{placeholder}}}", str(value))
+    return prompt
+
+
+def pile_action_history(history, max_num=4):
+    if len(history) > 0:
+        return '\n'.join(history[-max_num:])
+    else:
+        return 'None'

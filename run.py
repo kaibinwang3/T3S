@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from functools import partial
 from omegaconf import OmegaConf
 
 
@@ -18,25 +19,24 @@ def get_gpu_list():
         return []
 
 
-# Set Device when WORLD SIZE > 1, Only Single Node Scenario Considered Now
 RANK = int(os.environ.get('RANK', 0))
 WORLD_SIZE = int(os.environ.get('WORLD_SIZE', 1))
+LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE",1))
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK",1))
+
 GPU_LIST = get_gpu_list()
-# if WORLD_SIZE > 1 and len(GPU_LIST):
-#     NGPU = len(GPU_LIST)
-#     assert NGPU >= WORLD_SIZE, "The number of processes should be less than or equal to the number of GPUs"
-#     GPU_PER_PROC = NGPU // WORLD_SIZE
-#     DEVICE_START_IDX = GPU_PER_PROC * RANK
-#     CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
-#     CUDA_VISIBLE_DEVICES = ','.join(CUDA_VISIBLE_DEVICES)
-#     # Set CUDA_VISIBLE_DEVICES
-#     os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
-#     print(f'RANK: {RANK}, WORLD_SIZE: {WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}')
-if WORLD_SIZE > 1 and len(GPU_LIST):
-    CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST]
+if LOCAL_WORLD_SIZE > 1 and len(GPU_LIST):
+    NGPU = len(GPU_LIST)
+    assert NGPU >= LOCAL_WORLD_SIZE, "The number of processes should be less than or equal to the number of GPUs"
+    GPU_PER_PROC = NGPU // LOCAL_WORLD_SIZE
+    DEVICE_START_IDX = GPU_PER_PROC * LOCAL_RANK
+    CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
     CUDA_VISIBLE_DEVICES = ','.join(CUDA_VISIBLE_DEVICES)
     os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
-    print(f'RANK: {RANK}, WORLD_SIZE: {WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}')
+    print(
+        f'RANK: {RANK}, LOCAL_RANK: {LOCAL_RANK}, WORLD_SIZE: {WORLD_SIZE},'
+        f'LOCAL_WORLD_SIZE: {LOCAL_WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}'
+    )
 
 
 from vlmeval.config import supported_VLM
@@ -49,9 +49,11 @@ from vlmeval.smp import *
 from vlmeval.utils.result_transfer import MMMU_result_transfer, MMTBench_result_transfer
 
 
+# Make WORLD_SIZE invisible when build models
 def build_model_from_config(cfg, model_name, use_vllm=False):
     import vlmeval.api
     import vlmeval.vlm
+    ws_bak = os.environ.pop('WORLD_SIZE', None)
 
     config = cp.deepcopy(cfg[model_name])
     if use_vllm:
@@ -60,11 +62,15 @@ def build_model_from_config(cfg, model_name, use_vllm=False):
         return supported_VLM[model_name](**config)
     cls_name = config.pop('class')
     if hasattr(vlmeval.api, cls_name):
-        return getattr(vlmeval.api, cls_name)(**config)
+        model = getattr(vlmeval.api, cls_name)(**config)
     elif hasattr(vlmeval.vlm, cls_name):
-        return getattr(vlmeval.vlm, cls_name)(**config)
+        model = getattr(vlmeval.vlm, cls_name)(**config)
     else:
         raise ValueError(f'Class {cls_name} is not supported in `vlmeval.api` or `vlmeval.vlm`')
+
+    if ws_bak:
+        os.environ['WORLD_SIZE'] = ws_bak
+    return model
 
 
 def build_dataset_from_config(cfg, dataset_name):
@@ -170,7 +176,7 @@ You can launch the evaluation by setting either --data and --model or --config.
     # Work Dir
     parser.add_argument('--work-dir', type=str, default='./outputs', help='select the output directory')
     # Infer + Eval or Infer Only
-    parser.add_argument('--mode', type=str, default='all', choices=['all', 'infer'])
+    parser.add_argument('--mode', type=str, default='all', choices=['all', 'infer', 'eval'])
     # API Kwargs, Apply to API VLMs and Judge API LLMs
     parser.add_argument('--api-nproc', type=int, default=4, help='Parallel API calling')
     parser.add_argument('--retry', type=int, default=None, help='retry numbers for API VLMs')
@@ -185,11 +191,38 @@ You can launch the evaluation by setting either --data and --model or --config.
     # Reuse: will reuse the existing prediction files
     parser.add_argument('--reuse', action='store_true')
     # Reuse-aux: if set, when reuse is True, will also reuse the auxiliary evaluation files
-    parser.add_argument('--reuse-aux', type=bool, default=True, help='reuse auxiliary evaluation files')
+    parser.add_argument('--reuse-aux', type=int, default=True, help='reuse auxiliary evaluation files')
     parser.add_argument(
         '--use-vllm', action='store_true', help='use vllm to generate, the flag is only supported in Llama4 for now')
+    parser.add_argument('--use-verifier', action='store_true', help='use verifier to evaluate')
 
     parser.add_argument('--model_config', type=str, default='')
+
+    # parser.add_argument('--nframe', type=int)  # btnkij
+
+    # btnkij: fused attention config
+    # parser.add_argument('--use_fused_attention', action='store_true')
+    # parser.add_argument('--full_attention_layers', type=int, default=2)
+    # parser.add_argument('--alpha', type=float, default=0.9, help='alpha * A_gpu + (1 - alpha) * A_cpu')
+    # parser.add_argument('--cpu_attention_type', type=str, default="random_projection_attention")
+    # parser.add_argument('--proj_dim', type=int, default=16)
+    # parser.add_argument('--n_hashes', type=int, default=8)
+    # parser.add_argument('--top_p', type=float, default=0.1)
+    # parser.add_argument('--n_bits', type=int, default=10)
+
+    # # btnkij: sketch config
+    # parser.add_argument('--use_sketch', action='store_true')
+    # parser.add_argument('--sketch_type', type=str, default=None)
+    # parser.add_argument('--num_sketch_tokens', type=int, default=4*13*(13+1))
+
+    # # btnkij: merge config
+    # parser.add_argument('--use_merge', action='store_true')
+    # parser.add_argument('--merge_layer', type=int, default=14)
+    # parser.add_argument('--chunk_size', type=int, default=16*13*(13+1))
+    # parser.add_argument('--chunk_id', type=int, default=0)
+
+    # # btnkij: icl
+    # parser.add_argument('--frame_per_chunk', type=int, default=16*13*(13+1))
 
     # parser.add_argument('--nframe', type=int)  # btnkij
 
@@ -288,6 +321,16 @@ def main():
                 v.keywords['verbose'] = args.verbose
                 supported_VLM[k] = v
 
+        # If FWD_API is set, will use class `GPT4V` for all API models in the config
+        if os.environ.get('FWD_API', None) == '1':
+            from vlmeval.config import api_models as supported_APIs
+            from vlmeval.api import GPT4V
+            for m in args.model:
+                if m in supported_APIs:
+                    kws = supported_VLM[m].keywords
+                    supported_VLM[m] = partial(GPT4V, **kws)
+                    logger.warning(f'FWD_API is set, will use class `GPT4V` for {m}')
+
     if WORLD_SIZE > 1:
         import torch.distributed as dist
         dist.init_process_group(
@@ -319,7 +362,8 @@ def main():
                 dist.barrier()
 
             try:
-                result_file_base = f'{model_name}_{dataset_name}.xlsx'
+                pred_format = get_pred_file_format()
+                result_file_base = f'{model_name}_{dataset_name}.{pred_format}'
 
                 if use_config:
                     if WORLD_SIZE > 1:
@@ -348,48 +392,13 @@ def main():
                         continue
 
                 # Handling Multi-Turn Dataset
-                if dataset.TYPE == 'MT':
-                    result_file_base = result_file_base.replace('.xlsx', '.tsv')
-
                 result_file = osp.join(pred_root, result_file_base)
-
                 # Reuse the previous prediction file if exists
                 if RANK == 0 and len(prev_pred_roots):
-                    prev_result_files = []
-                    prev_pkl_file_list = []
-                    for root in prev_pred_roots[::-1]:
-                        if osp.exists(osp.join(root, result_file_base)):
-                            if args.reuse_aux:
-                                prev_result_files = fetch_aux_files(osp.join(root, result_file_base))
-                            else:
-                                prev_result_files = [osp.join(root, result_file_base)]
-                            break
-                        elif commit_id in root and len(ls(root)) and root != pred_root:
-                            temp_files = ls(root, match=[dataset_name, '.pkl'])
-                            if len(temp_files):
-                                prev_pkl_file_list.extend(temp_files)
-                                break
-                    if not args.reuse:
-                        prev_result_files = []
-                        prev_pkl_file_list = []
-                    if len(prev_result_files):
-                        for prev_result_file in prev_result_files:
-                            src = prev_result_file
-                            tgt = osp.join(pred_root, osp.basename(src))
-                            if not osp.exists(tgt):
-                                shutil.copy(src, tgt)
-                                logger.info(f'--reuse is set, will reuse the prediction file {src}.')
-                            else:
-                                logger.warning(f'File already exists: {tgt}')
-
-                    elif len(prev_pkl_file_list):
-                        for fname in prev_pkl_file_list:
-                            target_path = osp.join(pred_root, osp.basename(fname))
-                            if not osp.exists(target_path):
-                                shutil.copy(fname, target_path)
-                                logger.info(f'--reuse is set, will reuse the prediction pickle file {fname}.')
-                            else:
-                                logger.warning(f'File already exists: {target_path}')
+                    prepare_reuse_files(
+                        pred_root_meta=pred_root_meta, eval_id=eval_id, model_name=model_name,
+                        dataset_name=dataset_name, reuse=args.reuse, reuse_aux=args.reuse_aux
+                    )
 
                 if WORLD_SIZE > 1:
                     dist.barrier()
@@ -397,38 +406,39 @@ def main():
                 if model is None:
                     model = model_name  # which is only a name
 
-                # Perform the Inference
-                if dataset.MODALITY == 'VIDEO':
-                    model = infer_data_job_video(
-                        model,
-                        work_dir=pred_root,
-                        model_name=model_name,
-                        dataset=dataset,
-                        result_file_name=result_file_base,
-                        verbose=args.verbose,
-                        api_nproc=args.api_nproc,
-                        use_vllm=args.use_vllm,
-                        model_config=model_config)
-                elif dataset.TYPE == 'MT':
-                    model = infer_data_job_mt(
-                        model,
-                        work_dir=pred_root,
-                        model_name=model_name,
-                        dataset=dataset,
-                        verbose=args.verbose,
-                        api_nproc=args.api_nproc,
-                        ignore_failed=args.ignore,
-                        use_vllm=args.use_vllm)
-                else:
-                    model = infer_data_job(
-                        model,
-                        work_dir=pred_root,
-                        model_name=model_name,
-                        dataset=dataset,
-                        verbose=args.verbose,
-                        api_nproc=args.api_nproc,
-                        ignore_failed=args.ignore,
-                        use_vllm=args.use_vllm)
+                if args.mode != "eval":
+                    # Perform the Inference
+                    if dataset.MODALITY == 'VIDEO':
+                        model = infer_data_job_video(
+                            model,
+                            work_dir=pred_root,
+                            model_name=model_name,
+                            dataset=dataset,
+                            result_file_name=result_file_base,
+                            verbose=args.verbose,
+                            api_nproc=args.api_nproc,
+                            use_vllm=args.use_vllm,
+                            model_config=model_config)
+                    elif dataset.TYPE == 'MT':
+                        model = infer_data_job_mt(
+                            model,
+                            work_dir=pred_root,
+                            model_name=model_name,
+                            dataset=dataset,
+                            verbose=args.verbose,
+                            api_nproc=args.api_nproc,
+                            ignore_failed=args.ignore,
+                            use_vllm=args.use_vllm)
+                    else:
+                        model = infer_data_job(
+                            model,
+                            work_dir=pred_root,
+                            model_name=model_name,
+                            dataset=dataset,
+                            verbose=args.verbose,
+                            api_nproc=args.api_nproc,
+                            ignore_failed=args.ignore,
+                            use_vllm=args.use_vllm)
 
                 # Set the judge kwargs first before evaluation or dumping
 
@@ -446,26 +456,50 @@ def main():
                 else:
                     print(dataset_name)
                     if dataset.TYPE in ['MCQ', 'Y/N', 'MCQ_MMMU_Pro'] or listinstr(
-                        ['moviechat1k'], dataset_name.lower()
+                        ['moviechat1k', 'mme-reasoning'], dataset_name.lower()
                     ):
-                        if listinstr(['WeMath'], dataset_name):
+                        if listinstr(['WeMath', 'MME-Reasoning'], dataset_name):
                             judge_kwargs['model'] = 'gpt-4o-mini'
                         elif listinstr(['VisuLogic'], dataset_name):
                             judge_kwargs['model'] = 'exact_matching'
                         else:
                             judge_kwargs['model'] = 'chatgpt-0125'
                     elif listinstr(['MMVet', 'LLaVABench', 'MMBench_Video'], dataset_name):
-                        judge_kwargs['model'] = 'gpt-4-turbo'
+                        if listinstr(['LLaVABench_KO'], dataset_name):
+                            judge_kwargs['model'] = 'gpt-4o-0806'
+                        else:
+                            judge_kwargs['model'] = 'gpt-4-turbo'
                     elif listinstr(['VGRPBench'], dataset_name):
                         judge_kwargs['model'] = 'gpt-4o'
-                    elif listinstr(['MathVista', 'MathVerse', 'MathVision', 'DynaMath', 'VL-RewardBench', 'LogicVista', 'MOAT'], dataset_name):  # noqa: E501
+                    elif listinstr(['MathVista', 'MathVerse', 'MathVision', 'DynaMath', 'VL-RewardBench', 'LogicVista', 'MOAT', 'OCR_Reasoning'], dataset_name):  # noqa: E501
                         judge_kwargs['model'] = 'gpt-4o-mini'
+                    elif listinstr(['OlympiadBench'], dataset_name):
+                        use_api_judger = judge_kwargs.get("olympiad_use_api_judger", False)
+                        if use_api_judger:
+                            judge_kwargs['model'] = 'gpt-4o-mini'
                     elif listinstr(['MMLongBench', 'MMDU', 'DUDE', 'SLIDEVQA', 'MIA-Bench', 'WildVision', 'MMAlignBench', 'MM-IFEval'], dataset_name):  # noqa: E501
+                        judge_kwargs['model'] = 'gpt-4o'
+                    elif listinstr(['ChartMimic'], dataset_name):
                         judge_kwargs['model'] = 'gpt-4o'
                     elif listinstr(['VDC'], dataset_name):
                         judge_kwargs['model'] = 'llama31-8b'
-                    elif listinstr(['VideoMMLU_QA', 'VideoMMLU_CAP'], dataset_name):
+                    elif listinstr(['Video_MMLU_QA', 'Video_MMLU_CAP'], dataset_name):
                         judge_kwargs['model'] = 'qwen-72b'
+                    elif listinstr(['MMVMBench'], dataset_name):
+                        judge_kwargs['model'] = 'gpt-4o'
+                    elif listinstr(['CVQA_EN', 'CVQA_LOC'], dataset_name):
+                        judge_kwargs['model'] = 'gpt-4.1'
+                    elif listinstr(['M4Bench'], dataset_name):
+                        judge_kwargs['model'] = 'gpt-4o'
+                    elif listinstr(['AyaVisionBench'], dataset_name):
+                        judge_kwargs['model'] = 'gpt-4.1'
+                    elif listinstr(['MathCanvas'], dataset_name):
+                        judge_kwargs['model'] = 'gpt-4.1-2025-04-14'
+
+                if args.use_verifier:
+                    judge_kwargs['use_verifier'] = True
+                if args.use_vllm:
+                    judge_kwargs['use_vllm'] = True
 
                 if RANK == 0:
                     logger.info(judge_kwargs)

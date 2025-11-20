@@ -1,1 +1,2 @@
-from .valley_eagle_chat import ValleyEagleChat
+from .valley2 import Valley2Chat
+from .valley3 import Valley3Chat

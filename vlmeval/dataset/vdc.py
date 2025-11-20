@@ -1,6 +1,7 @@
 # flake8: noqa
 from huggingface_hub import snapshot_download
 from ..smp import *
+from ..smp.file import get_intermediate_file_path, get_file_extension
 from .video_base import VideoBaseDataset
 from .utils import build_judge, DEBUG_MESSAGE
 from ..utils import track_progress_rich
@@ -117,7 +118,7 @@ main_object_caption_prompts = [
 
 class VDC(VideoBaseDataset):
 
-    MD5 = 'df8efe00d7e7a7621807693f762d0016'
+    MD5 = ''
 
     TYPE = 'Video-VQA'
 
@@ -247,7 +248,6 @@ class VDC(VideoBaseDataset):
             assert line < len(self)
             line = self.data.iloc[line]
 
-        # 构建提示内容
         if line['caption_type'] == 'short':
             prompt = random.choice(short_caption_prompts)
         elif line['caption_type'] == 'detailed':
@@ -260,14 +260,12 @@ class VDC(VideoBaseDataset):
             prompt = random.choice(camera_caption_prompts)
 
         if video_llm:
-            # 对于视频LLM，返回视频路径和文本
             video_path = os.path.join(self.video_path, line['video'])
             return [
-                dict(type='video', value=video_path),  # 添加视频信息
+                dict(type='video', value=video_path),
                 dict(type='text', value=prompt)
             ]
         else:
-            # 如果不是视频LLM，返回帧图像和文本
             frames = self.save_video_frames(os.path.splitext(line['video'])[0])
             message = []
             for im in frames:
@@ -349,16 +347,16 @@ class VDC(VideoBaseDataset):
     def evaluate(self, eval_file, **judge_kwargs):
         from .utils.vdc import get_dimension_rating, prepare_response_prompt, prepare_score_prompt, SYSTEM_CAL_SCORE_PROMPT, SYSTEM_GENER_PRED_PROMPT
 
-        assert eval_file.endswith('.xlsx'), 'data file should be an xlsx file'
+        assert get_file_extension(eval_file) in ['xlsx', 'json', 'tsv'], 'data file should be an supported format (xlsx/json/tsv) file'
         judge = judge_kwargs['model']
         nproc = judge_kwargs.pop('nproc', 4)
         _ = judge_kwargs.pop('verbose', None)
         _ = judge_kwargs.pop('retry', None)
 
-        response_file = eval_file.replace('.xlsx', f'_{judge}_response.pkl')
-        tmp_file = eval_file.replace('.xlsx', f'_{judge}_tmp.pkl')
-        tgt_file = eval_file.replace('.xlsx', f'_{judge}_rating.json')
-        score_file = eval_file.replace('.xlsx', f'_{judge}_score.xlsx')
+        response_file = get_intermediate_file_path(eval_file, f'_{judge}_response', 'pkl')
+        tmp_file = get_intermediate_file_path(eval_file, f'_{judge}_tmp', 'pkl')
+        tgt_file = get_intermediate_file_path(eval_file, f'_{judge}_rating', 'json')
+        score_file = get_intermediate_file_path(eval_file, f'_{judge}_score')
 
         model = build_judge(**judge_kwargs)
 
@@ -382,10 +380,8 @@ class VDC(VideoBaseDataset):
                     print(f"Error message: {str(e)}")
                     continue
 
-            # 转换回DataFrame并重置index
             expanded_df = pd.DataFrame(expanded_data).reset_index(drop=True)
 
-            # 继续处理展开后的数据
             data_un = expanded_df[~expanded_df['index'].isin(res)]
             data_un = data_un[~pd.isna(data_un['prediction'])]
             lt = len(data_un)
