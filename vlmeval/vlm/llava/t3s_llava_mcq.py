@@ -107,7 +107,7 @@ def unpack_model_outputs(outputs, original_lengths):
     return unpacked_outputs
 
 
-class ProdecodeLlavaVideoRandframeTokenLogitsPack(BaseModel):
+class T3S_Llava_MCQ(BaseModel):
     INSTALL_REQ = True
     INTERLEAVE = True
     VIDEO_LLM = True

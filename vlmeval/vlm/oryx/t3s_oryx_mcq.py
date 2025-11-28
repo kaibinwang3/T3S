@@ -1,27 +1,101 @@
 import re
-import os
-import argparse
 import torch
 import math
 import numpy as np
 from typing import Dict, Optional, Sequence, List, Union
 import transformers
-from transformers import AutoConfig
 from PIL import Image
 from decord import VideoReader, cpu
-import copy
 
-from oryx.conversation import conv_templates, SeparatorStyle
 from oryx.model.builder import load_pretrained_model
-from oryx.utils import disable_torch_init
-from oryx.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria, process_anyres_video_genli
+from oryx.mm_utils import get_model_name_from_path, process_anyres_video_genli
 from oryx.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from oryx.model.language_model.oryx_qwen import (
-    GenerateOutput
-)
 
 from ..base import BaseModel
 from ...smp import *
+
+
+
+def pack_embeds_with_position_ids_for_flash_attn(embeds_list, device):
+    """
+    将embeds列表pack成一个序列，并生成对应的position_ids，用于Flash Attention
+    
+    Args:
+        embeds_list: List[torch.Tensor] - 每个tensor是一个序列的embeds [seq_len, hidden_size]
+        device: 设备
+    
+    Returns:
+        dict: 包含packed inputs和Flash Attention所需参数的字典
+    """
+    # 获取每个序列的长度
+    seq_lengths = [embeds.shape[0] for embeds in embeds_list]
+    original_lengths = seq_lengths.copy()
+    
+    # 计算cumulative lengths (从0开始)
+    cu_seq_lens = torch.zeros(len(seq_lengths) + 1, dtype=torch.int32, device=device)
+    cu_seq_lens[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0)
+    
+    # Pack inputs_embeds - 直接连接所有embeds
+    packed_embeds = torch.cat(embeds_list, dim=0)  # [total_length, hidden_size]
+    
+    # 生成position_ids - 每个序列从0开始
+    position_ids_list = []
+    for seq_len in seq_lengths:
+        position_ids_list.append(torch.arange(seq_len, dtype=torch.long, device=device))
+    
+    # Pack position_ids
+    packed_position_ids = torch.cat(position_ids_list, dim=0)  # [total_length]
+    
+    # 创建packed attention_mask - 全1，因为Flash Attention通过cu_seq_lens处理边界
+    total_length = packed_embeds.shape[0]
+    packed_attention_mask = torch.ones(total_length, dtype=torch.long, device=device)
+    
+    # 最大序列长度
+    max_length = max(seq_lengths)
+    
+    return {
+        'inputs_embeds': packed_embeds.unsqueeze(0),          # [1, total_length, hidden_size]
+        'position_ids': packed_position_ids.unsqueeze(0),     # [1, total_length]
+        'attention_mask': packed_attention_mask.unsqueeze(0), # [1, total_length]
+        'cu_seq_lens_q': cu_seq_lens,                         # [num_seqs + 1]
+        'cu_seq_lens_k': cu_seq_lens,                         # [num_seqs + 1]
+        'max_length_q': max_length,                           # int
+        'max_length_k': max_length,                           # int
+        'original_lengths': original_lengths                  # List[int]
+    }
+
+
+def unpack_model_outputs(outputs, original_lengths):
+    """
+    将packed的模型输出解包回原始的list格式
+    
+    Args:
+        outputs: 模型输出，包含last_hidden_state等
+        original_lengths: 原始序列长度列表
+    
+    Returns:
+        List[torch.Tensor]: 解包后的输出列表
+    """
+    # 获取last_hidden_state
+    if hasattr(outputs, 'last_hidden_state'):
+        hidden_states = outputs.last_hidden_state
+    else:
+        # 如果是tuple或其他格式，取第一个元素
+        hidden_states = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+    
+    # 移除batch维度
+    hidden_states = hidden_states.squeeze(0)  # [total_length, hidden_size]
+    
+    unpacked_outputs = []
+    start_idx = 0
+    
+    for length in original_lengths:
+        end_idx = start_idx + length
+        seq_hidden = hidden_states[start_idx:end_idx]  # [seq_len, hidden_size]
+        unpacked_outputs.append(seq_hidden)
+        start_idx = end_idx
+    
+    return unpacked_outputs
 
 
 def split_list(lst, n):
@@ -115,7 +189,7 @@ def random_sample_video(video_file, nframe):
     return video
 
 
-class ProdecodeOryxRandframeLogitsAlpha(BaseModel):
+class T3S_Oryx_MCQ(BaseModel):
     INSTALL_REQ = True
     INTERLEAVE = True
     VIDEO_LLM = True
@@ -123,10 +197,10 @@ class ProdecodeOryxRandframeLogitsAlpha(BaseModel):
     IMAGE_TOKEN_INDEX = -200
 
     def __init__(
-            self,
-            model_path="/mnt/afs/wangkaibin/models/Oryx-1.5-7B",
-            model_config=None,
-            **kwargs
+        self,
+        model_path="/mnt/afs/wangkaibin/models/Oryx-1.5-7B",
+        model_config=None,
+        **kwargs
     ):
         super().__init__()
         self.model_config = model_config
@@ -147,7 +221,8 @@ class ProdecodeOryxRandframeLogitsAlpha(BaseModel):
 
     @torch.no_grad
     def generate_inner_video(self, message, dataset=None):
-        alpha = [self.model_config.alpha]
+        all_alpha = self.model_config.alpha
+        bsz = len(all_alpha)
 
         video_file = None
         for item in message:
@@ -157,17 +232,20 @@ class ProdecodeOryxRandframeLogitsAlpha(BaseModel):
         assert video_file is not None
 
         nframe = self.model_config.nframe
-        video = random_sample_video(video_file, nframe)
-        nframe = len(video)
+        all_video = []
+        for _ in range(bsz):
+            video = random_sample_video(video_file, nframe)
+            nframe = len(video)
+            all_video.extend(video)
 
-        video_processed = []
-        modalities = ["video_long"] * len(video)
-        for idx, frame in enumerate(video):
+        all_video_processed = []
+        all_modalities = ["video_long"] * len(all_video)
+        for idx, frame in enumerate(all_video):
             self.image_processor.do_resize = False
             self.image_processor.do_center_crop = False
             frame = process_anyres_video_genli(frame, self.image_processor)
-            video_processed.append(frame.unsqueeze(0))
-        video_processed = torch.cat(video_processed, dim=0).bfloat16().cuda()
+            all_video_processed.append(frame.unsqueeze(0))
+        all_video_processed = torch.cat(all_video_processed, dim=0).bfloat16().cuda()
 
         question = ''
         system_prompt = "You are a helpful assistant."
@@ -184,50 +262,65 @@ class ProdecodeOryxRandframeLogitsAlpha(BaseModel):
             qwen_message, self.tokenizer, has_image=True, system_message=system_prompt
         ).cuda()
 
+        all_input_ids = [input_ids.clone().squeeze(0) for _ in range(bsz)]
+
         if dataset == "LongVideoBench":
             num_options = 5
         else:
             num_options = 4
         option_ids = self.tokenizer(
-            # [chr(ord('A') + i) for i in range(num_options)] + [f" {chr(ord('A') + i)}" for i in range(num_options)],
             [chr(ord('A') + i) for i in range(num_options)],
             return_tensors="pt"
         ).input_ids.flatten().to(input_ids.device)
 
-        _, position_ids, attention_mask, _, inputs_embeds = self.OryxMetaForCausalLM_prepare_inputs_labels_for_multimodal(
+        packed_inputs = self.OryxMetaForCausalLM_prepare_inputs_labels_for_multimodal(
             self.model,
-            input_ids, alpha, 
-            modalities, video_processed, video_processed
+            all_input_ids, all_alpha, 
+            all_modalities, all_video_processed, all_video_processed
         )
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(0)
         torch.cuda.synchronize(0)
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         all_outputs = self.model(
             input_ids=None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+            attention_mask=packed_inputs['attention_mask'],
+            position_ids=packed_inputs['position_ids'],
             past_key_values=None,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=packed_inputs['inputs_embeds'],
             use_cache=True,
-            cache_position=position_ids,
+            cache_position=packed_inputs['position_ids'],
+            cu_seq_lens_q=packed_inputs['cu_seq_lens_q'],
+            cu_seq_lens_k=packed_inputs['cu_seq_lens_k'],
+            max_length_q=packed_inputs['max_length_q'],
+            max_length_k=packed_inputs['max_length_k'],
         )
 
         torch.cuda.synchronize(0)
-        end_time = time.time()
+        end_time = time.perf_counter()
         peak_mem_stats = torch.cuda.max_memory_allocated(0)
         extra = {
             "time": end_time - start_time,
             "peak_mem": peak_mem_stats
         }
-        last_logits = all_outputs.logits[:, -1, :]
+        logits = all_outputs.logits
+        logits = unpack_model_outputs(logits, packed_inputs['original_lengths'])
+        last_logits = torch.stack([logits[0][-1], logits[1][-1]])
 
-        option_logits = last_logits[:, option_ids].view(-1, num_options).sum(0)
-        generated_ids = option_ids[torch.argmax(option_logits)].unsqueeze(0)
+        option_logits = last_logits[:, option_ids].view(bsz, -1, num_options).sum(1)
+
+        first_option_logits = option_logits[0]
+        second_option_logits = option_logits[1:].mean(0)
+        top2_options = torch.argsort(first_option_logits, descending=True)[:2]
+        if second_option_logits[top2_options[0]] >= second_option_logits[top2_options[1]]:
+            generated_ids = option_ids[top2_options[0]].unsqueeze(0)
+        else:
+            generated_ids = option_ids[top2_options[1]].unsqueeze(0)
         extra.update({
-            "option_logits": option_logits.to(torch.float16).detach().cpu().numpy(),
+            "first_option_logits": first_option_logits.to(torch.float16).detach().cpu().numpy(),
+            "second_option_logits": second_option_logits.to(torch.float16).detach().cpu().numpy(),
         })
 
         outputs = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -339,24 +432,6 @@ class ProdecodeOryxRandframeLogitsAlpha(BaseModel):
             modality_max_length_dict = {"image": modality_max_length[0], "text": modality_max_length[1], "video": modality_max_length[2]}
             new_input_embeds =[x[: modality_max_length_dict[modality]] for x, modality in zip(new_input_embeds, modalities)]
 
-        # Combine them
-        max_len = max(x.shape[0] for x in new_input_embeds)
-        batch_size = len(new_input_embeds)
-
-        new_input_embeds_padded = []
-        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
-        position_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
-
-        for i, cur_new_embed in enumerate(new_input_embeds):
-            cur_len = cur_new_embed.shape[0]
-            new_input_embeds_padded.append(torch.cat((
-                torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device),
-                cur_new_embed
-            ), dim=0))
-            if cur_len > 0:
-                attention_mask[i, -cur_len:] = True
-                position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
-            
-        new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
-
-        return None, position_ids, attention_mask, None, new_input_embeds
+        device = new_input_embeds[0].device
+        packed_inputs = pack_embeds_with_position_ids_for_flash_attn(new_input_embeds, device)
+        return packed_inputs

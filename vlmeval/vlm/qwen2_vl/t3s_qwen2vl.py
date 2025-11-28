@@ -1,41 +1,25 @@
 from __future__ import annotations
 
+import logging
+import math
 import os
-
-import qwen_vl_utils.vision_process
+import warnings
+from typing import List, Optional, Tuple, Union
 
 import decord
-import torch
 import numpy as np
-import os
-import time
-from typing import Tuple, Optional, Union, List
+import qwen_vl_utils.vision_process
+import torch
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLCausalLMOutputWithPast
+    Qwen2_5_VLCausalLMOutputWithPast,
 )
-from thop import profile
-import json
 
+from ...dataset import DATASET_MODALITY
+from ...smp import get_gpu_memory, get_rank_and_world_size, listinstr
+from ..base import BaseModel
+from .prompt import Qwen2VLPromptMixin
 
-class ForwardWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, position_ids, attention_mask, inputs_embeds,
-                cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k):
-        outputs = self.model.language_model(
-            position_ids=position_ids,
-            attention_mask=attention_mask, 
-            inputs_embeds=inputs_embeds,
-            cu_seq_lens_q=cu_seq_lens_q,
-            cu_seq_lens_k=cu_seq_lens_k,
-            max_length_q=max_length_q,
-            max_length_k=max_length_k
-        )
-        hidden_states = outputs[0]
-        logits = self.model.lm_head(hidden_states)
-        return logits
+VLLM_MAX_IMAGE_INPUT_NUM = 24
 
 
 def sample_random_frames_decord(ele: dict) -> Tuple[torch.Tensor, float]:
@@ -76,103 +60,15 @@ def sample_random_frames_decord(ele: dict) -> Tuple[torch.Tensor, float]:
         video = vr.get_batch(idx).asnumpy()
         video = torch.from_numpy(video).permute(0, 3, 1, 2)
         sample_fps = nframes / max(total_frames, 1) * video_fps
-        return video, sample_fps
+        video_metadata = dict(
+            fps=video_fps,
+            frames_indices=idx,
+            total_num_frames=total_frames,
+            video_backend="decord",
+        )
+        return video, video_metadata, sample_fps
     except decord.DECORDError as e:
         raise RuntimeError(f"使用 decord 读取视频失败: {video_path}") from e
-
-
-def pack_processed_inputs_for_flash_attn(all_position_ids, all_attention_mask, all_inputs_embeds, device):
-    """
-    将已经处理好的inputs pack成一个序列，用于Flash Attention
-    
-    Args:
-        all_position_ids: List[torch.Tensor] - 每个tensor是一个序列的position_ids
-        all_attention_mask: List[torch.Tensor] - 每个tensor是一个序列的attention_mask  
-        all_inputs_embeds: List[torch.Tensor] - 每个tensor是一个序列的inputs_embeds
-        device: 设备
-
-        # (Pdb) pp all_position_ids[0].shape
-        # torch.Size([3, 1, 36987])
-        # (Pdb) pp all_attention_mask[0].shape
-        # torch.Size([1, 36987])
-        # (Pdb) pp all_inputs_embeds[0].shape
-        # torch.Size([1, 36987, 3584])
-    
-    Returns:
-        dict: 包含packed inputs和Flash Attention所需参数的字典
-    """
-    # 获取每个序列的长度（从inputs_embeds获取，因为它包含实际的序列长度信息）
-    seq_lengths = [embeds.shape[1] for embeds in all_inputs_embeds]  # 假设embeds是[seq_len, hidden_size]
-    original_lengths = seq_lengths.copy()
-    
-    # 计算cumulative lengths (从0开始)
-    cu_seq_lens = torch.zeros(len(seq_lengths) + 1, dtype=torch.int32, device=device)
-    cu_seq_lens[1:] = torch.cumsum(torch.tensor(seq_lengths, device=device), dim=0)
-    
-    # Pack inputs_embeds - 直接连接
-    packed_inputs_embeds = torch.cat(all_inputs_embeds, dim=1)  # [total_length, hidden_size]
-    
-    # Pack position_ids - 连接所有position_ids
-    packed_position_ids = torch.cat(all_position_ids, dim=2)  # [total_length]
-    
-    # Pack attention_mask - 连接所有attention_mask
-    packed_attention_mask = torch.cat(all_attention_mask, dim=1)  # [total_length]
-    
-    # 最大序列长度
-    max_length = max(seq_lengths)
-    
-    return {
-        'inputs_embeds': packed_inputs_embeds,      # [1, total_length, hidden_size]
-        'position_ids': packed_position_ids,       # [1, total_length]
-        'attention_mask': packed_attention_mask,   # [1, total_length]
-        'cu_seq_lens_q': cu_seq_lens,                           # [num_seqs + 1]
-        'cu_seq_lens_k': cu_seq_lens,                           # [num_seqs + 1] 
-        'max_length_q': max_length,                             # int
-        'max_length_k': max_length,                             # int
-        'original_lengths': original_lengths                    # List[int]
-    }
-
-def unpack_outputs(hidden_states, original_lengths):
-    """
-    将packed的输出解包回原始的list格式
-    
-    Args:
-        hidden_states: packed的隐藏状态 [1, total_length, hidden_size]
-        original_lengths: 原始序列长度列表
-    
-    Returns:
-        List[torch.Tensor]: 解包后的隐藏状态列表，每个是[seq_len, hidden_size]
-    """
-    # 移除batch维度
-    hidden_states = hidden_states.squeeze(0)  # [total_length, hidden_size]
-    
-    unpacked_outputs = []
-    start_idx = 0
-    
-    for length in original_lengths:
-        end_idx = start_idx + length
-        seq_hidden = hidden_states[start_idx:end_idx]  # [seq_len, hidden_size]
-        unpacked_outputs.append(seq_hidden)
-        start_idx = end_idx
-    
-    return unpacked_outputs
-
-
-import sys
-import warnings
-import math
-import logging
-import time
-from functools import partial
-
-import torch
-
-from ..base import BaseModel
-from .prompt import Qwen2VLPromptMixin
-from ...smp import get_rank_and_world_size, get_gpu_memory, listinstr
-from ...dataset import DATASET_MODALITY
-
-VLLM_MAX_IMAGE_INPUT_NUM = 24
 
 
 def ensure_image_url(image: str) -> str:
@@ -298,14 +194,14 @@ def setup_visible_devices_per_rank():
     return num_gpus
 
 
-class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseModel):
+class T3S_Qwen2VL(Qwen2VLPromptMixin, BaseModel):
     INSTALL_REQ = False
     INTERLEAVE = True
     VIDEO_LLM = True
 
     def __init__(
         self,
-        model_path: str = "/mnt/afs/wangkaibin/models/Qwen2.5-VL-7B-Instruct",
+        model_path: str = "Qwen/Qwen2.5-VL-7B-Instruct",
         min_pixels: int | None = None,
         max_pixels: int | None = None,
         total_pixels: int | None = None,
@@ -443,40 +339,63 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
         return content
 
     def generate_inner_transformers(self, message, dataset=None):
+        """
+        Generates a sequence of tokens autoregressively using a custom sampling strategy, KV cache,
+        and a repetition penalty to mitigate repetition.
+        """
         try:
             from qwen_vl_utils import process_vision_info
         except Exception as err:
-            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")  # noqa: E501
+            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")
             raise err
 
+        # --- 1. Initialization ---
         messages = []
         if self.system_prompt is not None:
             messages.append({'role': 'system', 'content': self.system_prompt})
+        
+        # Update the user prompt to encourage step-by-step reasoning
+        # Note: This assumes message is a list of dicts with a 'value' key.
+        # Adjust if your data structure is different.
+        if isinstance(message, list) and message:
+            message[-1]['value'] = message[-1]['value'].replace(
+                "Answer with the option's letter from the given choices directly.",
+                "First, provide a step-by-step reasoning for your choice, and then conclude with the final answer starting with 'So the answer is'."
+            )
         messages.append({'role': 'user', 'content': self._prepare_content(message, dataset=dataset)})
+
         if self.verbose:
             print(f'\033[31m{messages}\033[0m')
 
-        self.generate_kwargs["max_new_tokens"] = 1
-        self.generate_kwargs["do_sample"] = True
-        self.generate_kwargs["top_k"] = None
-        self.generate_kwargs["top_p"] = None
+        # The batch size is now dynamically controlled by the number of alpha values.
+        alpha_list = self.model_config.alpha
+        batch_size = len(alpha_list)
 
-        all_inputs = []
+        # --- Configuration for generation ---
+        self.generate_kwargs["max_new_tokens"] = 1024
+        top_k = self.model_config.topk
+        # Get repetition penalty from config, default to 1.0 (no penalty)
+        repetition_penalty = getattr(self.model_config, 'repetition_penalty', 1.0)
+        eos_token_id = self.processor.tokenizer.eos_token_id
+        device = 'cuda'
+
+        # --- 2. Prompt Processing and Initial KV Cache Generation ---
+        # This part seems inefficient as it processes the same message multiple times.
+        # For this change, we'll keep it as-is to focus on the repetition penalty.
         input_ids_list = []
         pixel_values_videos_list = []
         video_grid_thw_list = []
         second_per_grid_ts_list = []
-        for _ in range(2):
+
+        for _ in range(batch_size):
             text = self.processor.apply_chat_template([messages], tokenize=False, add_generation_prompt=True)
             images, videos = process_vision_info([messages])
-            inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
-            inputs = inputs.to('cuda')
-            input_ids_list.append(inputs.input_ids)
-            pixel_values_videos_list.append(inputs.pixel_values_videos)
-            video_grid_thw_list.append(inputs.video_grid_thw)
-            second_per_grid_ts_list.append(inputs.second_per_grid_ts)
-
-        alpha_list = self.model_config.alpha
+            initial_inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')
+            initial_inputs = initial_inputs.to(device)
+            input_ids_list.append(initial_inputs.input_ids)
+            pixel_values_videos_list.append(initial_inputs.pixel_values_videos)
+            video_grid_thw_list.append(initial_inputs.video_grid_thw)
+            second_per_grid_ts_list.append(initial_inputs.second_per_grid_ts)
 
         all_position_ids, all_attention_mask, all_inputs_embeds = \
             self.prepare_multimodal_inputs(
@@ -487,53 +406,87 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
                 alpha_list=alpha_list
             )
 
-        packed_inputs = pack_processed_inputs_for_flash_attn(
-            all_position_ids, 
-            all_attention_mask, 
-            all_inputs_embeds, 
-            all_position_ids[0].device
+        outputs = self.model.model(
+            position_ids=all_position_ids,
+            attention_mask=all_attention_mask,
+            inputs_embeds=all_inputs_embeds,
+            use_cache=True
         )
+        
+        past_key_values = outputs.past_key_values
+        logits = self.model.lm_head(outputs.last_hidden_state)
 
-        if not hasattr(self, "perf_record"):
-            self.perf_record = []
-            self.forward_wrapper = ForwardWrapper(self.model)
+        # --- 3. Assertion and Token Selection for the FIRST token ---
+        assert logits.shape[0] == 2, f"Token selection logic requires a batch size of 2, but got {logits.shape[0]} from len(self.model_config.alpha)."
 
-        inputs = (
-            packed_inputs['position_ids'],
-            packed_inputs['attention_mask'], 
-            packed_inputs['inputs_embeds'],
-            packed_inputs['cu_seq_lens_q'],
-            packed_inputs['cu_seq_lens_k'],
-            packed_inputs['max_length_q'],
-            packed_inputs['max_length_k']
-        )
+        last_logits1 = logits[0, -1, :]
+        last_logits2 = logits[1, -1, :]
+        _, topk_indices = torch.topk(last_logits1, top_k)
+        second_logits_for_topk = last_logits2[topk_indices]
+        best_token_in_topk = torch.argmax(second_logits_for_topk)
+        next_token_id = topk_indices[best_token_in_topk].unsqueeze(0)
 
-        torch.cuda.synchronize(0)
-        start_time = time.perf_counter()
-        logits = self.forward_wrapper(*inputs)
-        torch.cuda.synchronize(0)
-        end_time = time.perf_counter()
+        generated_token_ids = [next_token_id]
 
-        flops, _ = profile(self.forward_wrapper, inputs=inputs, verbose=False)
+        # --- 4. Autoregressive Generation Loop with KV Cache ---
+        for i in range(1, self.generate_kwargs["max_new_tokens"]):
+            if next_token_id.item() == eos_token_id:
+                break
 
-        self.perf_record.append({
-            "wall_clock": end_time - start_time,
-            "flops": flops
-        })
+            next_token_embeds = self.model.model.get_input_embeddings()(next_token_id).unsqueeze(0).expand(2, -1, -1)
+            all_attention_mask = torch.cat(
+                [all_attention_mask, torch.ones((2, 1), dtype=torch.long, device=device)], dim=1
+            )
+            next_position_ids = all_position_ids[:, :, -1:] + i
 
-        warmup_step = self.model_config.timeit.warmup_step
-        test_step = self.model_config.timeit.test_step
-        if len(self.perf_record) == warmup_step + test_step:
-            self.perf_record = self.perf_record[warmup_step:]
-            timeit_result = {
-                "wall_clock": sum(it["wall_clock"] for it in self.perf_record) / test_step,
-                "gflops": sum(it["flops"] for it in self.perf_record) / test_step / 1e9
-            }
-            with open(self.model_config.timeit.output_path, 'w') as f:
-                json.dump(timeit_result, f, indent=2)
-            sys.exit(0)
+            outputs = self.model.language_model(
+                inputs_embeds=next_token_embeds,
+                attention_mask=all_attention_mask,
+                position_ids=next_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+            
+            past_key_values = outputs.past_key_values
+            logits = self.model.lm_head(outputs.last_hidden_state)
 
-        response = 'A'
+            # --- APPLY REPETITION PENALTY ---
+            if repetition_penalty > 1.0 and len(generated_token_ids) > 0:
+                generated_ids_tensor = torch.cat(generated_token_ids, dim=-1).squeeze()
+                if generated_ids_tensor.dim() == 0:
+                    generated_ids_tensor = generated_ids_tensor.unsqueeze(0)
+                
+                unique_generated_ids = torch.unique(generated_ids_tensor)
+
+                # Apply penalty to both sets of logits
+                for logit_set in [logits[0, -1, :], logits[1, -1, :]]:
+                    scores_to_penalize = torch.gather(logit_set, 0, unique_generated_ids)
+                    penalized_scores = torch.where(
+                        scores_to_penalize > 0,
+                        scores_to_penalize / repetition_penalty,
+                        scores_to_penalize * repetition_penalty
+                    )
+                    logit_set.scatter_(0, unique_generated_ids, penalized_scores)
+            # --- End of Repetition Penalty ---
+
+            last_logits1 = logits[0, -1, :]
+            last_logits2 = logits[1, -1, :]
+            _, topk_indices = torch.topk(last_logits1, top_k)
+            second_logits_for_topk = last_logits2[topk_indices]
+            best_token_in_topk = torch.argmax(second_logits_for_topk)
+            next_token_id = topk_indices[best_token_in_topk].unsqueeze(0)
+
+            generated_token_ids.append(next_token_id)
+
+        # --- 5. Finalization ---
+        generated_ids = torch.cat(generated_token_ids, dim=-1).unsqueeze(0)
+        response = self.processor.tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+
+        if self.verbose:
+            print(f'\033[32m{response}\033[0m')
+
         return response
 
     def generate_inner(self, message, dataset=None):
@@ -611,12 +564,12 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
                     second_per_grid_ts,
                     attention_mask,
                 )
-                self.rope_deltas = rope_deltas
+                self.model.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
                 delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
+                    (cache_position[0] + self.model.rope_deltas).to(inputs_embeds.device)
                     if cache_position is not None
                     else 0
                 )
@@ -678,27 +631,26 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
             all_attention_mask.append(attention_mask)
             all_inputs_embeds.append(inputs_embeds)
 
-        # max_len = max(it.shape[1] for it in all_inputs_embeds)
-        # device = all_inputs_embeds[0].device
-        # for i in range(bsz):
-        #     pad_len = max_len - all_inputs_embeds[i].shape[1]
-        #     if pad_len == 0:
-        #         continue
-        #     all_position_ids[i] = torch.cat([
-        #         torch.zeros([3, 1, pad_len], dtype=torch.long, device=device), all_position_ids[i]
-        #     ], dim=2)
-        #     all_attention_mask[i] = torch.cat([
-        #         torch.zeros([1, pad_len], dtype=torch.long, device=device), all_attention_mask[i]
-        #     ], dim=1)
-        #     all_inputs_embeds[i] = torch.cat([
-        #         torch.zeros([1, pad_len, all_inputs_embeds[i].shape[2]], dtype=all_inputs_embeds[i].dtype, device=device), all_inputs_embeds[i]
-        #     ], dim=1)
+        max_len = max(it.shape[1] for it in all_inputs_embeds)
+        device = all_inputs_embeds[0].device
+        for i in range(bsz):
+            pad_len = max_len - all_inputs_embeds[i].shape[1]
+            if pad_len == 0:
+                continue
+            all_position_ids[i] = torch.cat([
+                torch.zeros([3, 1, pad_len], dtype=torch.long, device=device), all_position_ids[i]
+            ], dim=2)
+            all_attention_mask[i] = torch.cat([
+                torch.zeros([1, pad_len], dtype=torch.long, device=device), all_attention_mask[i]
+            ], dim=1)
+            all_inputs_embeds[i] = torch.cat([
+                torch.zeros([1, pad_len, all_inputs_embeds[i].shape[2]], dtype=all_inputs_embeds[i].dtype, device=device), all_inputs_embeds[i]
+            ], dim=1)
 
-        # all_position_ids = torch.cat(all_position_ids, dim=1)
-        # all_attention_mask = torch.cat(all_attention_mask, dim=0)
-        # all_inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
+        all_position_ids = torch.cat(all_position_ids, dim=1)
+        all_attention_mask = torch.cat(all_attention_mask, dim=0)
+        all_inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
         return all_position_ids, all_attention_mask, all_inputs_embeds
-
 
     def Qwen2_5_VLForConditionalGeneration_forward(
         wrapper,
@@ -813,7 +765,7 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
             # calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache_position is not None and cache_position[0] == 0)
-                or self.rope_deltas is None
+                or self.model.rope_deltas is None
                 or (past_key_values is None or past_key_values.get_seq_length() == 0)
             ):
                 position_ids, rope_deltas = self.get_rope_index(
@@ -823,12 +775,12 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
                     second_per_grid_ts,
                     attention_mask,
                 )
-                self.rope_deltas = rope_deltas
+                self.model.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
                 delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
+                    (cache_position[0] + self.model.rope_deltas).to(inputs_embeds.device)
                     if cache_position is not None
                     else 0
                 )
@@ -891,5 +843,5 @@ class ProdecodeQwen2VLRandframeTokenLogitsPackTimeit(Qwen2VLPromptMixin, BaseMod
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
+            rope_deltas=self.model.rope_deltas,
         )

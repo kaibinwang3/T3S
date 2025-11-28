@@ -417,3 +417,11 @@ visualize/
 outputs/
 thirdparty/
 **/test*
+**/*.bak
+/summary.py
+/show.py
+/empty_cuda.sh
+/flash_attn_triton.py
+/flush_attn_kv_score.py
+/attention_utils.py
+/sketch_utils.py
