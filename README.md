@@ -23,7 +23,7 @@ Instead of processing a single long sequence of video tokens, T3S performs $m$ i
 3.  **Aggregation:** Packs subsequences into a single forward pass and aggregates logits (via averaging or cross-refinement).
 
 <div align="center">
-  <img src="assets/framework.pdf" alt="T3S Framework" width="800"/>
+  <img src="assets/framework.png" alt="T3S Framework" width="800"/>
 </div>
 
 ## Usage
