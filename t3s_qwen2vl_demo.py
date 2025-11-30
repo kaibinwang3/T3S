@@ -10,14 +10,14 @@ model_config = OmegaConf.create({
 
 MODEL_CLASS = supported_VLM['t3s_qwen2vl']
 model = MODEL_CLASS(
-    model_path="/mnt/afs/wangkaibin/models/Qwen2.5-VL-7B-Instruct",
+    model_path="Qwen/Qwen2.5-VL-7B-Instruct",
     model_config=model_config
 )
 
 message = [
     {
         "type": "video",
-        "value": "/mnt/afs/share_data/opencompass/.cache/VideoMME/video/_8lBR0E_Tx8.mp4"
+        "value": "/your/video/path"
     },
     {
         "type": "text",
