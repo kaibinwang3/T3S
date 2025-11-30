@@ -10,7 +10,7 @@ This repository contains the official implementation of the paper: **"Test-Time 
 
 ## Key Features
 
-- **Efficient:** Reduces first-token latency by up to **2.04$\times$** on long videos.
+- **Efficient:** Reduces first-token latency by up to **2.04x** on long videos.
 - **Effective:** Improves accuracy by up to **3.1%** on benchmarks like LongVideoBench.
 - **Training-Free:** No fine-tuning or adapter training required. Works directly with pre-trained models.
 - **Universal:** Plug-and-play compatibility with state-of-the-art MLLMs.
@@ -33,7 +33,7 @@ T3S is designed to wrap around existing MLLM inference pipelines.
 ### Basic Inference
 To run inference on a video using T3S with Qwen2.5-VL:
 
-```python
+```bash
 python t3s_qwen2vl_demo.py
 ```
 
@@ -53,15 +53,33 @@ bash eval_vtw_qwen2vl.sh
 
 **Accuracy (%) and Speedup Comparison:**
 
-| Model | Dataset | Baseline Acc | **T3S Acc** | **Speedup** |
-| :--- | :--- | :---: | :---: | :---: |
-| **Qwen2.5-VL-7B** | VideoMME | 63.9 | **65.2** | **2.03$\times$** |
-| | LongVideoBench | 59.2 | **62.3** | **2.04$\times$** |
-| | MLVU (M-Avg) | 68.3 | **69.7** | **2.01$\times$** |
-| **LLaVA-Video-7B** | VideoMME | 64.0 | **65.1** | 1.69$\times$ |
-| | LongVideoBench | 56.2 | **59.1** | 1.50$\times$ |
+| Model | VideoMME (short) | VideoMME (medium) | VideoMME (long) | VideoMME (overall) | Speedup |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Qwen2.5-VL-7B | 0.746 | 0.637 | 0.536 | 0.639 | - |
+| + T3S | 0.766 | 0.644 | 0.546 | 0.652 | 2.03x |
+| LLaVA-Video-7B | 0.758 | 0.627 | 0.536 | 0.640 | - |
+| + T3S | 0.774 | 0.633 | 0.545 | 0.651 | 1.69x |
+| Oryx-1.5-7B | 0.711 | 0.559 | 0.516 | 0.595 | - |
+| + T3S | 0.717 | 0.561 | 0.526 | 0.601 | 1.32x |
 
-*Note: Speedup is measured relative to the baseline model without token reduction.*
+
+| Model | LongVideoBench (15) | LongVideoBench (60) | LongVideoBench (600) | LongVideoBench (3600) | LongVideoBench (overall) | Speedup |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Qwen2.5-VL-7B | 0.720 | 0.750 | 0.578 | 0.512 | 0.592 | - |
+| + T3S | 0.751 | 0.762 | 0.631 | 0.535 | 0.623 | 2.04x |
+| LLaVA-Video-7B | 0.672 | 0.721 | 0.561 | 0.479 | 0.562 | - |
+| + T3S | 0.693 | 0.727 | 0.604 | 0.505 | 0.591 | 1.50x |
+| Oryx-1.5-7B 256frm | 0.614 | 0.703 | 0.566 | 0.518 | 0.570 | - |
+| + T3S | 0.646 | 0.703 | 0.578 | 0.535 | 0.586 | 1.31x |
+
+| Model | MLVU (PQA) | MLVU (NQA) | MLVU (ER) | MLVU (AC) | MLVU (AO) | MLVU (AR) | MLVU (TR) | MLVU (M-Avg) | Speedup |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Qwen2.5-VL-7B | 0.729 | 0.808 | 0.608 | 0.340 | 0.514 | 0.770 | 0.890 | 0.683 | - |
+| + T3S | 0.740 | 0.794 | 0.616 | 0.354 | 0.602 | 0.765 | 0.890 | 0.697 | 2.01x |
+| LLaVA-Video-7B | 0.775 | 0.808 | 0.656 | 0.393 | 0.625 | 0.685 | 0.874 | 0.688 | - |
+| + T3S | 0.777 | 0.749 | 0.622 | 0.461 | 0.606 | 0.705 | 0.863 | 0.701 | 1.72x |
+| Oryx-1.5-7B | 0.770 | 0.803 | 0.645 | 0.413 | 0.483 | 0.700 | 0.867 | 0.692 | - |
+| + T3S | 0.776 | 0.802 | 0.631 | 0.379 | 0.494 | 0.685 | 0.882 | 0.690 | 1.23x |
 
 ## Project Structure
 
